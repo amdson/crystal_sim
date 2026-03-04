@@ -1,7 +1,7 @@
 mod candidates;
-mod config;
-mod kmc;
-mod particle;
+pub mod config;
+pub mod kmc;
+pub mod particle;
 mod rates;
 mod rng;
 mod spatial;

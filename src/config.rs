@@ -27,9 +27,21 @@ pub struct SimConfig {
     /// How many arc angles to sample around isolated particles
     #[serde(default = "default_angles")]
     pub num_isolated_angles: u32,
+    /// Steepest-descent steps run after each attachment (0 = disabled)
+    #[serde(default = "default_relax_steps")]
+    pub relax_steps: u32,
+    /// Step size for the steepest-descent relaxation
+    #[serde(default = "default_relax_alpha")]
+    pub relax_alpha: f64,
+    /// Harmonic spring stiffness for the relaxation potential
+    #[serde(default = "default_spring_k")]
+    pub spring_k: f64,
 }
 
 fn default_angles() -> u32 { 12 }
+fn default_relax_steps() -> u32 { 30 }
+fn default_relax_alpha() -> f64 { 0.01 }
+fn default_spring_k() -> f64 { 50.0 }
 
 impl SimConfig {
     pub fn n_types(&self) -> usize {

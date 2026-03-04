@@ -8,6 +8,7 @@ use crate::rates::RateCatalog;
 use crate::rng::Rng;
 use crate::spatial::SpatialHash;
 
+use std::time::{Instant, SystemTime};
 pub struct Simulation {
     pub particles: Vec<Particle>,
     /// neighbors[i] = indices of particles bonded to particle i
@@ -64,6 +65,7 @@ impl Simulation {
     // ── KMC step loop ────────────────────────────────────────────────────────
 
     pub fn step(&mut self, n: u32) {
+        
         for _ in 0..n {
             let r_total = self.rates.total();
             if r_total <= 0.0 {
@@ -128,6 +130,8 @@ impl Simulation {
         for nb in nbs {
             self.update_detach_rate(nb);
         }
+
+        self.relax_new_particle(new_idx);
 
         self.regen_candidates_near(pos, regen_r);
         self.refresh_attach_rates();
@@ -252,6 +256,7 @@ impl Simulation {
         let eps_dedup_sq = eps_dedup * eps_dedup;
 
         // 1. Drop any existing candidate site within the affected region.
+        // TODO this is an expensive operation, get it to run using spacial hashing
         for type_c in 0..self.config.n_types() {
             self.candidates[type_c].retain(|s| s.pos.distance_squared(center) >= r_sq);
         }
@@ -417,6 +422,89 @@ impl Simulation {
         if type_id < self.config.n_types() {
             self.config.particle_types[type_id].mu = mu;
             self.refresh_attach_rates();
+        }
+    }
+
+    // ── Post-attachment relaxation ────────────────────────────────────────────
+
+    /// Steepest-descent relaxation of the newly attached particle.
+    ///
+    /// Uses a smooth harmonic potential:
+    ///   - bonded pairs:     U = spring_k * (r - r_contact)^2   (min at exact contact)
+    ///   - non-bonded nearby: U = spring_k * max(0, r_contact - r)^2  (soft repulsion only)
+    ///
+    /// After convergence the bond list is rebuilt so that any bonds that fell
+    /// outside [contact, contact+δ] are dropped, and any new ones are added.
+    fn relax_new_particle(&mut self, new_idx: usize) {
+        if self.config.relax_steps == 0 {
+            return;
+        }
+        let k = self.config.spring_k;
+        let alpha = self.config.relax_alpha;
+
+        for _ in 0..self.config.relax_steps {
+            let pos = self.particles[new_idx].pos;
+            let ri = self.particles[new_idx].radius;
+
+            // Collect nearby particles (need snapshot to avoid borrow conflict)
+            let query_r = ri + self.config.max_radius() + self.config.delta + 1e-6;
+            let nearby = self.spatial.query(pos.x, pos.y, query_r);
+
+            let mut force = DVec2::ZERO;
+
+            for &j in &nearby {
+                if j == new_idx {
+                    continue;
+                }
+                let r_vec = self.particles[j].pos - pos; // points from new toward j
+                let r = r_vec.length();
+                if r < 1e-12 {
+                    continue;
+                }
+                let r_hat = r_vec / r;
+                let r_contact = ri + self.particles[j].radius;
+
+                if self.neighbors[new_idx].contains(&j) {
+                    // Bonded spring: attractive if stretched, repulsive if compressed
+                    let stretch = r - r_contact;
+                    force += (2.0 * k * stretch) * r_hat;
+                } else {
+                    // Non-bonded soft-core: repulsive only
+                    let overlap = r_contact - r;
+                    if overlap > 0.0 {
+                        force -= (2.0 * k * overlap) * r_hat;
+                    }
+                }
+            }
+
+            // Move particle and update spatial hash
+            let old_pos = self.particles[new_idx].pos;
+            self.particles[new_idx].pos += alpha * force;
+            let new_pos = self.particles[new_idx].pos;
+            self.spatial.remove(new_idx, old_pos.x, old_pos.y);
+            self.spatial.insert(new_idx, new_pos.x, new_pos.y);
+        }
+
+        // Rebuild bond list for new_idx so any bond that moved out of [contact, contact+δ]
+        // is dropped, and any that moved into range is added.
+        let old_neighbors = self.neighbors[new_idx].clone();
+        for &nb in &old_neighbors {
+            self.neighbors[nb].retain(|&k| k != new_idx);
+        }
+        self.neighbors[new_idx].clear();
+        self.update_neighbors_for_new(new_idx);
+
+        // Refresh rates for new particle and all affected neighbors
+        self.update_detach_rate(new_idx);
+        let nbs = self.neighbors[new_idx].clone();
+        for nb in nbs {
+            self.update_detach_rate(nb);
+        }
+        // Also update old neighbors that may have lost the bond
+        for nb in old_neighbors {
+            if !self.neighbors[new_idx].contains(&nb) {
+                self.update_detach_rate(nb);
+            }
         }
     }
 
