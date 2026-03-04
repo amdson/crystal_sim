@@ -1,0 +1,147 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background: #0d0d0f;
+  color: #d0d0d8;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+}
+
+#app {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ── Canvas ─────────────────────────────────────────────────────────────── */
+
+#canvas {
+  flex: 1;
+  display: block;
+  background: #08090c;
+  cursor: crosshair;
+}
+
+/* ── Side panel ─────────────────────────────────────────────────────────── */
+
+#panel {
+  width: 220px;
+  flex-shrink: 0;
+  background: #13141a;
+  border-left: 1px solid #2a2b35;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  overflow-y: auto;
+  padding-bottom: 12px;
+}
+
+#panel h1 {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 14px 14px 10px;
+  border-bottom: 1px solid #2a2b35;
+  color: #e8e8f0;
+}
+
+#panel h3 {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #707088;
+  margin-bottom: 8px;
+}
+
+#panel section {
+  padding: 12px 14px;
+  border-bottom: 1px solid #1e1f28;
+}
+
+/* ── Form controls ───────────────────────────────────────────────────────── */
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: #a0a0b8;
+}
+
+label + label { margin-top: 10px; }
+
+input[type="range"] {
+  -webkit-appearance: none;
+  width: 100%;
+  height: 4px;
+  background: #2a2b3a;
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #6070d8;
+  cursor: pointer;
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #6070d8;
+  border: none;
+  cursor: pointer;
+}
+
+span { font-size: 11px; color: #6868a0; }
+
+/* ── Checkbox ───────────────────────────────────────────────────────────── */
+
+label:has(input[type="checkbox"]) {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+input[type="checkbox"] {
+  accent-color: #6070d8;
+  width: 14px;
+  height: 14px;
+}
+
+/* ── Stats ───────────────────────────────────────────────────────────────── */
+
+#stats {
+  font-size: 12px;
+  line-height: 1.8;
+  color: #7878a0;
+}
+
+#stats span {
+  font-size: 12px;
+  color: #c0c0d8;
+}
+
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+
+button {
+  background: #22233a;
+  border: 1px solid #3a3b55;
+  color: #c0c0d8;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  margin-right: 6px;
+  transition: background 0.15s;
+}
+
+button:hover { background: #2e2f50; }
+button:active { background: #3a3b60; }
