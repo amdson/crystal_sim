@@ -8,7 +8,7 @@ use crate::rates::RateCatalog;
 use crate::rng::Rng;
 use crate::spatial::SpatialHash;
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 #[repr(usize)] // Optional: Guarantees the underlying type is usize and ensures sequential values
 enum TimerEntry {
@@ -37,7 +37,9 @@ pub struct Simulation {
     /// Flat f32 particle buffer: [x, y, type_id_f32, radius, ...] stride 4
     pub particle_buf: Vec<f32>,
     pub timers : Vec<Duration>, 
-    pub usages: Vec<u32>, 
+    pub usages: Vec<u32>,
+    /// Reusable boolean mask for active-set relaxation (avoids per-call allocation).
+    in_active: Vec<bool>,
 }
 
 /*
@@ -55,7 +57,6 @@ Simulation steps
 impl Simulation {
     pub fn new(mut config: SimConfig) -> Self {
         config.init_cache();
-        let n_types = config.n_types();
         let cell_size = config.max_cutoff().max(0.1);
 
         let mut sim = Self {
@@ -71,7 +72,8 @@ impl Simulation {
             particle_buf: Vec::new(), 
             config, 
             timers: (0..TimerEntry::Count as usize).map(|_i| Duration::new(0, 0)).collect(), 
-            usages: vec![0; TimerEntry::Count as usize] 
+            usages: vec![0; TimerEntry::Count as usize],
+            in_active: Vec::new(),
         };
 
         // Seed crystal: one particle of type zero placed at the origin,
@@ -197,17 +199,19 @@ impl Simulation {
         self.add_particle_raw(Particle::new(pos.x, pos.y, type_c, rc));
 
         let new_idx = self.particles.len() - 1;
-        let regen_r = (self.config.max_cutoff() + rc) * 2.0;
-        self.update_detach_rate(new_idx); 
 
-        // Neighbours' binding energy increased → lower detach rate
-        let nbs = self.get_neighbors(new_idx);
-        for nb in nbs {
-            self.update_detach_rate(nb);
+        if self.config.relax_steps > 0 {
+            // Relaxation handles rate updates and candidate regen
+            self.relax_new_particle(new_idx);
+        } else {
+            self.update_detach_rate(new_idx);
+            let nbs = self.get_neighbors(new_idx);
+            for nb in nbs {
+                self.update_detach_rate(nb);
+            }
+            let regen_r = (self.config.max_cutoff() + rc) * 2.0;
+            self.regen_candidates_near(pos, regen_r);
         }
-
-        // self.relax_new_particle(new_idx); 
-        self.regen_candidates_near(pos, regen_r);
     }
 
     // ── Detach ───────────────────────────────────────────────────────────────
@@ -321,8 +325,6 @@ impl Simulation {
     /// all particles within `radius` of `center`.
     fn regen_candidates_near(&mut self, center: DVec2, radius: f64) {
         let r_sq = radius * radius;
-        let eps_dedup = self.config.max_radius() * 0.05;
-        let eps_dedup_sq = eps_dedup * eps_dedup;
 
         let nearby_sites = self.candidates_spatial.query(center.x, center.y, radius + self.config.max_cutoff());
         let to_delete: Vec<usize> = nearby_sites
@@ -481,83 +483,208 @@ impl Simulation {
     pub fn set_chemical_potential(&mut self, type_id: usize, mu: f64) {
         if type_id < self.config.n_types() {
             self.config.particle_types[type_id].mu = mu;
+            // Update attach rates for all candidates of this type
+            let new_rate = self.config.attach_rate(type_id);
+            for i in 0..self.candidates.len() {
+                if self.candidates[i].type_id == type_id {
+                    self.attach_rates.set_rate(i, new_rate);
+                }
+            }
         }
     }
 
     // ── Post-attachment relaxation ────────────────────────────────────────────
 
-    /// Steepest-descent relaxation of the newly attached particle.
+    /// Steepest-descent relaxation of the neighborhood of a newly attached particle.
     ///
-    /// Uses a smooth harmonic potential:
-    ///   - bonded pairs:     U = spring_k * (r - r_contact)^2   (min at exact contact)
-    ///   - non-bonded nearby: U = spring_k * max(0, r_contact - r)^2  (soft repulsion only)
-    ///
-    /// After convergence (or max steps), must call regen_candidates_near to update candidate sites/rates.
-    // regen_candidates_near should be rewritten to take a list of changed particles instead of a center/radius, so that we can call it on the affected neighborhood instead of a large fixed radius.
-    // modify other code calling regen_candidates_near accordingly
+    /// Uses an active-set propagation approach:
+    ///   1. Start with only the new particle in the active set.
+    ///   2. Each Jacobi step computes forces on all active particles from their
+    ///      current neighbors (harmonic spring: F = 2k(r − r_contact) r̂ for any
+    ///      pair within r_contact + δ).  Static friction is subtracted from the
+    ///      force magnitude (clamped at zero) before applying the displacement.
+    ///   3. Reaction forces on non-active neighbors are accumulated; if the total
+    ///      exceeds the static-friction threshold the neighbor is activated and
+    ///      given an initial displacement in the same step.
+    ///   4. Spatial hash is updated at the end of each step.
+    ///   5. After all steps, detach rates and candidate sites are refreshed for
+    ///      the full active set and its neighborhood.
     fn relax_new_particle(&mut self, new_idx: usize) {
         if self.config.relax_steps == 0 {
             return;
         }
+
         let k = self.config.spring_k;
         let alpha = self.config.relax_alpha;
-        let static_friction = self.config.max_radius() * 0.05; // below this force, treat as static friction and don't move
-        
+        let static_friction = self.config.max_radius() * 0.05;
+        let delta = self.config.delta;
+        let max_active: usize = 64; // cap to prevent runaway growth
+
+        let n_particles = self.particles.len();
+        let mut active: Vec<usize> = vec![new_idx];
+        // Grow the reusable mask if the particle count increased; all new slots are false
+        if self.in_active.len() < n_particles {
+            self.in_active.resize(n_particles, false);
+        }
+        self.in_active[new_idx] = true;
+
+        // Save initial positions for post-relaxation candidate regen
+        let mut initial_positions: Vec<DVec2> = vec![self.particles[new_idx].pos];
+
+        // Reusable buffers – cleared each step instead of reallocated
+        let mut old_positions: Vec<DVec2> = Vec::new();
+        let mut forces: Vec<DVec2> = Vec::new();
+        let mut touched: Vec<(usize, DVec2)> = Vec::new();
+        let mut moved: Vec<(usize, DVec2)> = Vec::new();
+        let mut agg: Vec<(usize, DVec2)> = Vec::new();
 
         for _ in 0..self.config.relax_steps {
-            let pos = self.particles[new_idx].pos;
-            let ri = self.particles[new_idx].radius;
+            let n_active = active.len();
 
-            // Collect nearby particles (need snapshot to avoid borrow conflict)
-            let query_r = ri + self.config.max_radius() + self.config.delta + 1e-6;
-            let nearby = self.spatial.query(pos.x, pos.y, query_r);
+            // Snapshot positions of currently active particles (Jacobi-style)
+            old_positions.clear();
+            old_positions.extend(active[..n_active].iter().map(|&idx| self.particles[idx].pos));
 
-            let mut force = DVec2::ZERO;
+            // Compute forces on each active particle
+            forces.clear();
+            touched.clear();
 
-            for &j in &nearby {
-                if j == new_idx {
-                    continue;
+            for &idx in &active[..n_active] {
+                let pos = self.particles[idx].pos;
+                let ri = self.particles[idx].radius;
+
+                let query_r = ri + self.config.max_radius() + delta + 1e-6;
+                let nearby = self.spatial.query(pos.x, pos.y, query_r);
+
+                let mut force = DVec2::ZERO;
+
+                for &j in &nearby {
+                    if j == idx || j >= n_particles {
+                        continue;
+                    }
+
+                    let r_vec = self.particles[j].pos - pos;
+                    let r = r_vec.length();
+                    if r < 1e-12 {
+                        continue;
+                    }
+                    let r_hat = r_vec / r;
+                    let r_contact = ri + self.particles[j].radius;
+
+                    // Unified harmonic spring for any pair within interaction range.
+                    // F = 2k(r − r_contact) r̂
+                    //   positive (attractive) when r > r_contact
+                    //   negative (repulsive)  when r < r_contact
+                    if r <= r_contact + delta {
+                        let f = (2.0 * k * (r - r_contact)) * r_hat;
+                        force += f;
+
+                        // Track reaction force on non-active neighbors
+                        if !self.in_active[j] {
+                            touched.push((j, -f)); // Newton's third law
+                        }
+                    }
                 }
-                let r_vec = self.particles[j].pos - pos; // points from new toward j
-                let r = r_vec.length();
-                if r < 1e-12 {
-                    continue;
-                }
-                let r_hat = r_vec / r;
-                let r_contact = ri + self.particles[j].radius;
 
-                if self.neighbors[new_idx].contains(&j) {
-                    // Bonded spring: attractive if stretched, repulsive if compressed
-                    let stretch = r - r_contact;
-                    force += (2.0 * k * stretch) * r_hat;
+                // Apply static friction: reduce magnitude, clamp at zero
+                let f_mag = force.length();
+                if f_mag > static_friction {
+                    force *= (f_mag - static_friction) / f_mag;
                 } else {
-                    // Non-bonded soft-core: repulsive only
-                    let overlap = r_contact - r;
-                    if overlap > 0.0 {
-                        force -= (2.0 * k * overlap) * r_hat;
+                    force = DVec2::ZERO;
+                }
+
+                forces.push(force);
+            }
+
+            // Track all particles that moved this step for spatial hash update
+            moved.clear();
+
+            // Apply Jacobi moves to all currently active particles
+            for i in 0..n_active {
+                let idx = active[i];
+                moved.push((idx, old_positions[i]));
+                self.particles[idx].pos = old_positions[i] + alpha * forces[i];
+            }
+
+            // Aggregate reaction forces on each touched neighbor, activate if
+            // total force exceeds static friction, and apply initial displacement.
+            if active.len() < max_active {
+                // Linear-scan aggregation (small N, no hashing overhead)
+                agg.clear();
+                for &(nb, f) in &touched {
+                    if let Some(entry) = agg.iter_mut().find(|(idx, _)| *idx == nb) {
+                        entry.1 += f;
+                    } else {
+                        agg.push((nb, f));
+                    }
+                }
+                for &(nb_idx, nb_force) in &agg {
+                    if active.len() >= max_active {
+                        break;
+                    }
+                    let f_mag = nb_force.length();
+                    if f_mag > static_friction {
+                        let old_pos = self.particles[nb_idx].pos;
+                        initial_positions.push(old_pos);
+                        let adjusted = nb_force * ((f_mag - static_friction) / f_mag);
+                        self.particles[nb_idx].pos += alpha * adjusted;
+                        self.in_active[nb_idx] = true;
+                        active.push(nb_idx);
+                        moved.push((nb_idx, old_pos));
                     }
                 }
             }
 
-            // Move particle and update spatial hash
-            let old_pos = self.particles[new_idx].pos;
-            self.particles[new_idx].pos += alpha * force;
-            let new_pos = self.particles[new_idx].pos;
-            self.spatial.remove(new_idx, old_pos.x, old_pos.y);
-            self.spatial.insert(new_idx, new_pos.x, new_pos.y);
+            // Update spatial hash for all particles that moved this step
+            for &(idx, ref old_pos) in &moved {
+                self.spatial.remove(idx, old_pos.x, old_pos.y);
+                let new_pos = self.particles[idx].pos;
+                self.spatial.insert(idx, new_pos.x, new_pos.y);
+            }
         }
 
-        // Refresh rates for new particle and all affected neighbors
-        self.update_detach_rate(new_idx);
-        let nbs = self.get_neighbors(new_idx);
-        for nb in nbs {
-            self.update_detach_rate(nb);
+        // ── Post-relaxation: refresh rates and candidate sites ────────────
+
+        // Collect every particle whose bonds may have changed (sorted + dedup, no HashSet)
+        let mut rate_indices: Vec<usize> = Vec::new();
+        for &idx in &active {
+            rate_indices.push(idx);
+            rate_indices.extend(self.get_neighbors(idx));
         }
-        // Also update old neighbors that may have lost the bond
-        for nb in old_neighbors {
-            if !nbs.contains(&nb) {
-                self.update_detach_rate(nb);
+        rate_indices.sort_unstable();
+        rate_indices.dedup();
+        for &idx in &rate_indices {
+            self.update_detach_rate(idx);
+        }
+
+        // Regenerate candidates near every active particle (current + initial positions)
+        let regen_r = self.config.max_cutoff() * 2.0;
+        let mut regen_centers: Vec<DVec2> =
+            Vec::with_capacity(active.len() + initial_positions.len());
+        for &idx in &active {
+            regen_centers.push(self.particles[idx].pos);
+        }
+        regen_centers.extend_from_slice(&initial_positions);
+
+        // Deduplicate nearby centers to avoid redundant work
+        let dedup_r_sq = (regen_r * 0.5) * (regen_r * 0.5);
+        let mut unique_centers: Vec<DVec2> = Vec::new();
+        for c in &regen_centers {
+            if unique_centers
+                .iter()
+                .all(|u| u.distance_squared(*c) > dedup_r_sq)
+            {
+                unique_centers.push(*c);
             }
+        }
+        for center in unique_centers {
+            self.regen_candidates_near(center, regen_r);
+        }
+
+        // Reset the in_active flags for reuse next call
+        for &idx in &active {
+            self.in_active[idx] = false;
         }
     }
 
@@ -572,4 +699,3 @@ impl Simulation {
         format!("[{}]", entries.join(","))
     }
 }
-
