@@ -20,16 +20,17 @@ impl Particle {
         self.pos.distance_squared(other.pos)
     }
 
-    /// Hard-core overlap: centers are closer than σ_i + σ_j
-    pub fn overlaps(&self, other: &Particle) -> bool {
+    /// Hard-core overlap: centers are closer than σ_i + σ_j - δ
+    pub fn overlaps(&self, other: &Particle, delta: f64) -> bool {
         let contact = self.radius + other.radius;
-        self.dist_sq(other) < contact * contact * (1.0 - 1e-9)
+        let overlap_dist = contact - delta;
+        overlap_dist > 0.0 && self.dist_sq(other) < overlap_dist * overlap_dist
     }
 
-    /// Bond: distance is within [contact, contact + δ)
+    /// Bond: distance is within [contact - δ, contact + δ]
     pub fn bonds_to(&self, other: &Particle, delta: f64) -> bool {
         let r = self.dist(other);
         let contact = self.radius + other.radius;
-        r >= contact * (1.0 - 1e-9) && r < contact + delta
+        r >= contact - delta && r <= contact + delta
     }
 }

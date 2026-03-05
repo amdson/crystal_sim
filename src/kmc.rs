@@ -8,66 +8,93 @@ use crate::rates::RateCatalog;
 use crate::rng::Rng;
 use crate::spatial::SpatialHash;
 
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
+
+#[repr(usize)] // Optional: Guarantees the underlying type is usize and ensures sequential values
+enum TimerEntry {
+    Select,
+    Attach,
+    Detach,
+    Rebuild,
+    Count, // Sentinel value to track the number of entries
+}
+
+static ENUM_STR: [&str; TimerEntry::Count as usize] = ["Select", "Attach", "Detach", "Rebuild"]; 
+
 pub struct Simulation {
-    pub particles: Vec<Particle>,
-    /// neighbors[i] = indices of particles bonded to particle i
-    pub neighbors: Vec<Vec<usize>>,
-    pub spatial: SpatialHash,
+    pub particles: Vec<Particle>, // Flat list of all particles, indexed by particle slot
+    pub spatial: SpatialHash, // Spatial hash for particles, indexed by particle slot
+    pub detach_rates: RateCatalog, //Detach rates indexed by particle slot
+
     /// candidates[type_id] = current valid attachment sites for that type
-    pub candidates: Vec<Vec<CandidateSite>>,
-    pub rates: RateCatalog,
+    pub candidates: Vec<CandidateSite>, // Flat list of all candidate sites, indexed by candidate index
+    pub candidates_spatial: SpatialHash, // Spatial hash for candidates, indexed by candidate index
+    pub attach_rates: RateCatalog, //Attach rates indexed by candidate index
+
     pub config: SimConfig,
     pub time: f64,
     pub rng: Rng,
     /// Flat f32 particle buffer: [x, y, type_id_f32, radius, ...] stride 4
     pub particle_buf: Vec<f32>,
+    pub timers : Vec<Duration>, 
+    pub usages: Vec<u32>, 
 }
 
+/*
+Simulation steps
+- Select candidate (add particle t at x, y or / remove particle i)
+- If add: 
+    - Add particle
+    - Run relaxation (Nx steps of gradient descent in neighborhood)
+    - Replace influenced candidates
+- If remove:
+    - Remove particle
+    - Replace influenced candidates
+*/
+
 impl Simulation {
-    pub fn new(config: SimConfig) -> Self {
+    pub fn new(mut config: SimConfig) -> Self {
+        config.init_cache();
         let n_types = config.n_types();
         let cell_size = config.max_cutoff().max(0.1);
 
         let mut sim = Self {
-            particles: Vec::new(),
-            neighbors: Vec::new(),
-            spatial: SpatialHash::new(cell_size),
-            candidates: vec![Vec::new(); n_types],
-            rates: RateCatalog::new(n_types),
+            particles: Vec::new(), 
+            spatial: SpatialHash::new(cell_size), 
+            detach_rates: RateCatalog::new(),
+            candidates: Vec::new(), 
+            candidates_spatial: SpatialHash::new(cell_size),  
+            attach_rates: RateCatalog::new(), 
+
             time: 0.0,
-            rng: Rng::new(config.seed),
-            particle_buf: Vec::new(),
-            config,
+            rng: Rng::new(config.seed),  
+            particle_buf: Vec::new(), 
+            config, 
+            timers: (0..TimerEntry::Count as usize).map(|_i| Duration::new(0, 0)).collect(), 
+            usages: vec![0; TimerEntry::Count as usize] 
         };
 
-        // Seed crystal: one particle of each type placed at the origin,
+        // Seed crystal: one particle of type zero placed at the origin,
         // offset by contact distance so they bond immediately.
         if sim.config.n_types() >= 1 {
-            let r0 = sim.config.radius(0);
-            sim.add_particle_raw(Particle::new(0.0, 0.0, 0, r0));
-        }
-        if sim.config.n_types() >= 2 {
-            let r0 = sim.config.radius(0);
-            let r1 = sim.config.radius(1);
-            let contact = r0 + r1;
-            sim.add_particle_raw(Particle::new(contact, 0.0, 1, r1));
+            let r0 = sim.config.radius(0); 
+            sim.add_particle_raw(Particle::new(0.0, 0.0, 0, r0));  
         }
 
         // Build initial candidate sites and rates
         let regen_r = sim.config.max_cutoff() * 4.0;
         sim.regen_candidates_near(DVec2::ZERO, regen_r);
-        sim.refresh_attach_rates();
-
         sim
     }
 
     // ── KMC step loop ────────────────────────────────────────────────────────
 
-    pub fn step(&mut self, n: u32) {
-        
+    pub fn step(&mut self, n: u32) { 
         for _ in 0..n {
-            let r_total = self.rates.total();
+            let now_sel = Instant::now();
+            let attach_total = self.attach_rates.total();
+            let detach_total = self.detach_rates.total();
+            let r_total = attach_total + detach_total;
             if r_total <= 0.0 {
                 break;
             }
@@ -78,28 +105,76 @@ impl Simulation {
             // BKL time advance: Δt = -ln(u2) / R_total
             self.time += -(u2.ln()) / r_total;
 
-            let event = self.rates.select(u1);
-            let n_types = self.config.n_types();
+            if u1 < attach_total / r_total {
+                // Attachment event
+                let attach_u = u1 * r_total / attach_total;
+                let candidate_ind = self.attach_rates.select(attach_u);
+                self.timers[TimerEntry::Select as usize] += now_sel.elapsed();
+                self.usages[TimerEntry::Select as usize] += 1;
 
-            if event < n_types {
-                // Attachment event for type `event`
-                let type_c = event;
-                if self.candidates[type_c].is_empty() {
-                    continue;
-                }
-                let site_idx = self.rng.next_usize(self.candidates[type_c].len());
-                let site = self.candidates[type_c][site_idx].clone();
+                let now = Instant::now();
+                let site = self.candidates[candidate_ind].clone();
                 self.attach(site);
+
+                self.timers[TimerEntry::Attach as usize] += now.elapsed(); 
+                self.usages[TimerEntry::Attach as usize] += 1; 
             } else {
-                // Detachment event for particle slot
-                let slot = event - n_types;
-                if slot < self.particles.len() {
-                    self.detach(slot);
-                }
+                // Detachment event
+                let detach_u = (u1 - attach_total / r_total) * r_total / detach_total;
+                let slot = self.detach_rates.select(detach_u);
+                self.timers[TimerEntry::Select as usize] += now_sel.elapsed();
+                self.usages[TimerEntry::Select as usize] += 1;
+
+                let now = Instant::now();
+                self.detach(slot);
+                self.timers[TimerEntry::Detach as usize] += now.elapsed(); 
+                self.usages[TimerEntry::Detach as usize] += 1; 
+
             }
         }
 
+        let now = Instant::now(); 
         self.rebuild_particle_buf();
+        self.timers[TimerEntry::Rebuild as usize] += now.elapsed(); 
+        self.usages[TimerEntry::Rebuild as usize] += 1; 
+        for i in 0..(TimerEntry::Count as usize) {
+            let time = self.timers[i]; 
+            let label = ENUM_STR[i]; 
+            if self.usages[i] > 0 {
+                let avg_time = self.timers[i] / self.usages[i]; 
+                println!("{label} avg time: {avg_time:?} total time: {time:?}");
+            } else {
+                println!("{label} avg time: N/A total time: {time:?}");
+            }
+        }
+    }
+
+
+    fn del_candidate(&mut self, site_idx: usize) {
+        if site_idx >= self.candidates.len() {
+            return;
+        }
+        let site = &self.candidates[site_idx];
+        self.candidates_spatial.remove(site_idx, site.pos.x, site.pos.y);
+        self.candidates.swap_remove(site_idx); // last element moves into site_idx
+        self.attach_rates.swap_remove_rate(site_idx); // same swap-remove in rate catalog to keep indices aligned
+
+        if site_idx < self.candidates.len() {
+            // If we swapped, we need to update the spatial hash for the moved candidate
+            let moved_site = &self.candidates[site_idx];
+            self.candidates_spatial.remove(self.candidates.len(), moved_site.pos.x, moved_site.pos.y); // remove old index
+            self.candidates_spatial.insert(site_idx, moved_site.pos.x, moved_site.pos.y); // insert new index
+        }
+    }
+
+    /// Batch-delete candidate sites. Sorts indices descending so that
+    /// swap_remove never invalidates a yet-to-be-deleted index.
+    fn del_candidates_batch(&mut self, mut indices: Vec<usize>) {
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        indices.dedup();
+        for site_idx in indices {
+            self.del_candidate(site_idx);
+        }
     }
 
     // ── Attach ───────────────────────────────────────────────────────────────
@@ -112,9 +187,10 @@ impl Simulation {
         // Final hard-core check — site may be stale after previous events
         let query_r = rc + self.config.max_radius() + 1e-6;
         let nearby = self.spatial.query(pos.x, pos.y, query_r);
+        // TODO change to filter syntax
         let positions: Vec<DVec2> = nearby.iter().map(|&i| self.particles[i].pos).collect();
         let radii: Vec<f64> = nearby.iter().map(|&i| self.particles[i].radius).collect();
-        if site_has_overlap(pos, rc, &(0..nearby.len()).collect::<Vec<_>>(), &positions, &radii) {
+        if site_has_overlap(pos, rc, self.config.delta, &(0..nearby.len()).collect::<Vec<_>>(), &positions, &radii) {
             return; // stale site
         }
 
@@ -122,19 +198,16 @@ impl Simulation {
 
         let new_idx = self.particles.len() - 1;
         let regen_r = (self.config.max_cutoff() + rc) * 2.0;
-        self.update_neighbors_for_new(new_idx);
-        self.update_detach_rate(new_idx);
+        self.update_detach_rate(new_idx); 
 
         // Neighbours' binding energy increased → lower detach rate
-        let nbs = self.neighbors[new_idx].clone();
+        let nbs = self.get_neighbors(new_idx);
         for nb in nbs {
             self.update_detach_rate(nb);
         }
 
-        self.relax_new_particle(new_idx);
-
+        // self.relax_new_particle(new_idx); 
         self.regen_candidates_near(pos, regen_r);
-        self.refresh_attach_rates();
     }
 
     // ── Detach ───────────────────────────────────────────────────────────────
@@ -145,46 +218,20 @@ impl Simulation {
         }
 
         let pos = self.particles[slot].pos;
-        let bonded = std::mem::take(&mut self.neighbors[slot]);
+        let bonded = self.get_neighbors(slot);
 
         // Remove from spatial hash
         self.spatial.remove(slot, pos.x, pos.y);
-
-        // Remove `slot` from every bonded neighbor's list
-        for &nb in &bonded {
-            self.neighbors[nb].retain(|&x| x != slot);
-        }
+        self.detach_rates.swap_remove_rate(slot);
 
         let last = self.particles.len() - 1;
-
+        self.particles.swap_remove(slot);
         if slot != last {
-            // Move the last particle into `slot`
-            let last_pos = self.particles[last].pos;
-            self.spatial.remove(last, last_pos.x, last_pos.y);
-            self.particles.swap(slot, last);
-            self.neighbors.swap(slot, last);
-            self.spatial.insert(slot, last_pos.x, last_pos.y);
-
-            // Rewrite all neighbor-list references: last → slot
-            let moved_nbs = self.neighbors[slot].clone();
-            for &nb in &moved_nbs {
-                for x in self.neighbors[nb].iter_mut() {
-                    if *x == last {
-                        *x = slot;
-                    }
-                }
-            }
-
-            // Swap-remove in rate catalog; moved particle keeps its rate
-            self.rates.remove_particle(slot);
-            // Recompute: moved particle may have lost the bond to `slot`
-            self.update_detach_rate(slot);
-        } else {
-            self.rates.remove_particle(slot);
+            // The element formerly at `last` is now at `slot`
+            let moved = &self.particles[slot];
+            self.spatial.remove(last, moved.pos.x, moved.pos.y);
+            self.spatial.insert(slot, moved.pos.x, moved.pos.y);
         }
-
-        self.particles.pop();
-        self.neighbors.pop();
 
         // Old neighbours lost a bond → update their detach rates
         for nb in bonded {
@@ -197,7 +244,6 @@ impl Simulation {
 
         let regen_r = self.config.max_cutoff() * 2.0;
         self.regen_candidates_near(pos, regen_r);
-        self.refresh_attach_rates();
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
@@ -207,26 +253,7 @@ impl Simulation {
         let idx = self.particles.len();
         self.spatial.insert(idx, p.pos.x, p.pos.y);
         self.particles.push(p);
-        self.neighbors.push(Vec::new());
-        self.rates.add_particle(0.0); // placeholder; caller must call update_detach_rate
-    }
-
-    /// Populate neighbors[new_idx] and update symmetric entries.
-    fn update_neighbors_for_new(&mut self, new_idx: usize) {
-        let p = self.particles[new_idx].clone();
-        let cutoff = p.radius + self.config.max_radius() + self.config.delta;
-        let nearby = self.spatial.query(p.pos.x, p.pos.y, cutoff);
-
-        for &ni in &nearby {
-            if ni == new_idx || ni >= self.particles.len() {
-                continue;
-            }
-            let other = &self.particles[ni];
-            if p.bonds_to(other, self.config.delta) {
-                self.neighbors[new_idx].push(ni);
-                self.neighbors[ni].push(new_idx);
-            }
-        }
+        self.detach_rates.add_rate(0.0); // placeholder; caller must call update_detach_rate
     }
 
     /// Compute E_bind for particle at `slot` and refresh its detachment rate.
@@ -236,18 +263,60 @@ impl Simulation {
         }
         let e_bind = self.binding_energy(slot);
         let rate = self.config.detach_rate(e_bind);
-        self.rates.set_detach_rate(slot, rate);
+        self.detach_rates.set_rate(slot, rate);
+    }
+
+    pub fn get_neighbors(&self, slot: usize) -> Vec<usize> {
+        if slot >= self.particles.len() {
+            return Vec::new();
+        }
+        // query spatial hash for nearby particles, then filter by actual bond distance
+        let p = &self.particles[slot];
+        let cutoff = p.radius + self.config.max_radius() + self.config.delta;
+        let nearby = self.spatial.query(p.pos.x, p.pos.y, cutoff);
+        nearby.into_iter()
+            .filter(|&ni| ni != slot && ni < self.particles.len() && p.bonds_to(&self.particles[ni], self.config.delta))
+            .collect()
     }
 
     /// Σ ε(type_i, type_j) over all bonded neighbours j.
     fn binding_energy(&self, slot: usize) -> f64 {
         let type_i = self.particles[slot].type_id;
-        self.neighbors[slot]
+        self.get_neighbors(slot)
             .iter()
             .map(|&nb| self.config.epsilon(type_i, self.particles[nb].type_id))
             .sum()
     }
 
+    fn site_binding_energy(&self, site: &CandidateSite) -> f64 {
+        let type_c = site.type_id;
+        let rc = self.config.radius(type_c);
+        let pos = site.pos;
+        let query_r = rc + self.config.max_radius() + self.config.delta;
+        let nearby = self.spatial.query(pos.x, pos.y, query_r);
+        nearby
+            .iter()
+            .filter(|&&i| {
+                let d = self.particles[i].pos.distance(pos);
+                let contact = self.particles[i].radius + rc;
+                d >= contact - self.config.delta && d <= contact + self.config.delta
+            })
+            .map(|&i| self.config.epsilon(type_c, self.particles[i].type_id))
+            .sum()
+    }
+
+    fn add_candidate(&mut self, site: CandidateSite) {
+        let type_c = site.type_id;
+        let pos = site.pos;
+        self.candidates.push(site);
+        let idx = self.candidates.len() - 1;
+
+        self.candidates_spatial.insert(idx, pos.x, pos.y);
+
+        let rate = self.config.attach_rate(type_c); 
+        self.attach_rates.add_rate(rate);
+    }
+        
     /// Remove stale candidates near `center`, then regenerate from scratch for
     /// all particles within `radius` of `center`.
     fn regen_candidates_near(&mut self, center: DVec2, radius: f64) {
@@ -255,14 +324,19 @@ impl Simulation {
         let eps_dedup = self.config.max_radius() * 0.05;
         let eps_dedup_sq = eps_dedup * eps_dedup;
 
-        // 1. Drop any existing candidate site within the affected region.
-        // TODO this is an expensive operation, get it to run using spacial hashing
-        for type_c in 0..self.config.n_types() {
-            self.candidates[type_c].retain(|s| s.pos.distance_squared(center) >= r_sq);
-        }
+        let nearby_sites = self.candidates_spatial.query(center.x, center.y, radius + self.config.max_cutoff());
+        let to_delete: Vec<usize> = nearby_sites
+            .iter()
+            .filter(|&&site_idx| {
+                site_idx < self.candidates.len()
+                    && self.candidates[site_idx].pos.distance_squared(center) < r_sq
+            })
+            .copied()
+            .collect();
+        self.del_candidates_batch(to_delete);
 
         // 2. Find particles whose neighbourhood overlaps the affected region.
-        let search_r = radius + self.config.max_cutoff();
+        let search_r = radius + self.config.max_cutoff() * 2.0;
         let focal: Vec<usize> = self
             .spatial
             .query(center.x, center.y, search_r)
@@ -270,7 +344,22 @@ impl Simulation {
             .filter(|&i| i < self.particles.len())
             .collect();
 
-        // 3. For each focal particle A and each candidate type C, generate sites.
+        // 3. Build overlap-check arrays once from a wider query that covers all
+        //    particles that could possibly overlap any candidate site generated
+        //    from focal particles.  A site is at most ~2*max_radius from a focal
+        //    particle, and an overlapper is at most ~2*max_radius from the site.
+        let overlap_r = search_r + 4.0 * self.config.max_radius();
+        let overlap_set: Vec<usize> = self
+            .spatial
+            .query(center.x, center.y, overlap_r)
+            .into_iter()
+            .filter(|&i| i < self.particles.len())
+            .collect();
+        let overlap_pos: Vec<DVec2> = overlap_set.iter().map(|&i| self.particles[i].pos).collect();
+        let overlap_rad: Vec<f64> = overlap_set.iter().map(|&i| self.particles[i].radius).collect();
+        let overlap_idx: Vec<usize> = (0..overlap_set.len()).collect();
+
+        // 4. For each focal particle A and each candidate type C, generate sites.
         for &a_idx in &focal {
             let a_pos = self.particles[a_idx].pos;
             let a_r = self.particles[a_idx].radius;
@@ -281,11 +370,6 @@ impl Simulation {
                 // All particles close enough to A that C can touch both
                 let pair_search = a_r + rc + self.config.max_radius() + rc + self.config.delta;
                 let nearby_indices = self.spatial.query(a_pos.x, a_pos.y, pair_search);
-
-                // Pre-build position/radius slices for overlap check
-                let all_pos: Vec<DVec2> = self.particles.iter().map(|p| p.pos).collect();
-                let all_rad: Vec<f64> = self.particles.iter().map(|p| p.radius).collect();
-                let all_idx: Vec<usize> = (0..self.particles.len()).collect();
 
                 let mut found_pair = false;
 
@@ -305,30 +389,23 @@ impl Simulation {
                         // Must be within bonding shell of both A and B
                         let da = a_pos.distance(site_pos);
                         let db = b_pos.distance(site_pos);
-                        if da < (a_r + rc) * (1.0 - 1e-6)
-                            || da >= a_r + rc + self.config.delta
+                        if da < (a_r + rc) - self.config.delta
+                            || da > a_r + rc + self.config.delta
                         {
                             continue;
                         }
-                        if db < (b_r + rc) * (1.0 - 1e-6)
-                            || db >= b_r + rc + self.config.delta
+                        if db < (b_r + rc) - self.config.delta
+                            || db > b_r + rc + self.config.delta
                         {
                             continue;
                         }
 
-                        if site_has_overlap(site_pos, rc, &all_idx, &all_pos, &all_rad) {
+                        if site_has_overlap(site_pos, rc, self.config.delta, &overlap_idx, &overlap_pos, &overlap_rad) {
                             continue;
                         }
-
-                        // Deduplicate against already-added sites for this type
-                        let dup = self.candidates[type_c]
-                            .iter()
-                            .any(|s| s.pos.distance_squared(site_pos) < eps_dedup_sq);
-                        if !dup {
-                            self.candidates[type_c]
-                                .push(CandidateSite { pos: site_pos, type_id: type_c });
-                            found_pair = true;
-                        }
+                        self.add_candidate(CandidateSite { pos: site_pos, type_id: type_c });
+                        found_pair = true;
+                        
                     }
                 }
 
@@ -355,30 +432,14 @@ impl Simulation {
                             let theta = (k as f64) * TAU / (n_ang as f64);
                             let site_pos =
                                 a_pos + DVec2::new(theta.cos(), theta.sin()) * r_contact;
-
-                            if site_has_overlap(site_pos, rc, &all_idx, &all_pos, &all_rad) {
-                                continue;
+                            if site_has_overlap(site_pos, rc, self.config.delta, &overlap_idx, &overlap_pos, &overlap_rad) {
+                                continue; 
                             }
-                            let dup = self.candidates[type_c]
-                                .iter()
-                                .any(|s| s.pos.distance_squared(site_pos) < eps_dedup_sq);
-                            if !dup {
-                                self.candidates[type_c]
-                                    .push(CandidateSite { pos: site_pos, type_id: type_c });
-                            }
+                            self.add_candidate(CandidateSite { pos: site_pos, type_id: type_c });
                         }
                     }
                 }
             }
-        }
-    }
-
-    /// Recompute aggregate attachment rates from current candidate counts.
-    fn refresh_attach_rates(&mut self) {
-        for type_c in 0..self.config.n_types() {
-            let n_sites = self.candidates[type_c].len() as f64;
-            let rate_per_site = self.config.attach_rate(type_c);
-            self.rates.set_attach_rate(type_c, n_sites * rate_per_site);
         }
     }
 
@@ -415,13 +476,11 @@ impl Simulation {
         for slot in 0..self.particles.len() {
             self.update_detach_rate(slot);
         }
-        self.refresh_attach_rates();
     }
 
     pub fn set_chemical_potential(&mut self, type_id: usize, mu: f64) {
         if type_id < self.config.n_types() {
             self.config.particle_types[type_id].mu = mu;
-            self.refresh_attach_rates();
         }
     }
 
@@ -433,14 +492,17 @@ impl Simulation {
     ///   - bonded pairs:     U = spring_k * (r - r_contact)^2   (min at exact contact)
     ///   - non-bonded nearby: U = spring_k * max(0, r_contact - r)^2  (soft repulsion only)
     ///
-    /// After convergence the bond list is rebuilt so that any bonds that fell
-    /// outside [contact, contact+δ] are dropped, and any new ones are added.
+    /// After convergence (or max steps), must call regen_candidates_near to update candidate sites/rates.
+    // regen_candidates_near should be rewritten to take a list of changed particles instead of a center/radius, so that we can call it on the affected neighborhood instead of a large fixed radius.
+    // modify other code calling regen_candidates_near accordingly
     fn relax_new_particle(&mut self, new_idx: usize) {
         if self.config.relax_steps == 0 {
             return;
         }
         let k = self.config.spring_k;
         let alpha = self.config.relax_alpha;
+        let static_friction = self.config.max_radius() * 0.05; // below this force, treat as static friction and don't move
+        
 
         for _ in 0..self.config.relax_steps {
             let pos = self.particles[new_idx].pos;
@@ -485,24 +547,15 @@ impl Simulation {
             self.spatial.insert(new_idx, new_pos.x, new_pos.y);
         }
 
-        // Rebuild bond list for new_idx so any bond that moved out of [contact, contact+δ]
-        // is dropped, and any that moved into range is added.
-        let old_neighbors = self.neighbors[new_idx].clone();
-        for &nb in &old_neighbors {
-            self.neighbors[nb].retain(|&k| k != new_idx);
-        }
-        self.neighbors[new_idx].clear();
-        self.update_neighbors_for_new(new_idx);
-
         // Refresh rates for new particle and all affected neighbors
         self.update_detach_rate(new_idx);
-        let nbs = self.neighbors[new_idx].clone();
+        let nbs = self.get_neighbors(new_idx);
         for nb in nbs {
             self.update_detach_rate(nb);
         }
         // Also update old neighbors that may have lost the bond
         for nb in old_neighbors {
-            if !self.neighbors[new_idx].contains(&nb) {
+            if !nbs.contains(&nb) {
                 self.update_detach_rate(nb);
             }
         }
@@ -519,3 +572,4 @@ impl Simulation {
         format!("[{}]", entries.join(","))
     }
 }
+

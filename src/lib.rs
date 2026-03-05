@@ -31,8 +31,9 @@ impl CrystalSim {
     /// Create a new simulation from a JSON config string.
     #[wasm_bindgen(constructor)]
     pub fn new(config_json: &str) -> Result<CrystalSim, JsValue> {
-        let config: SimConfig = serde_json::from_str(config_json)
+        let mut config: SimConfig = serde_json::from_str(config_json)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        config.init_cache();
         Ok(CrystalSim { inner: Simulation::new(config) })
     }
 

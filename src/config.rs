@@ -16,7 +16,8 @@ pub struct SimConfig {
     pub particle_types: Vec<ParticleTypeDef>,
     /// N×N symmetric interaction matrix ε_ij. Positive = attractive.
     pub epsilon: Vec<Vec<f64>>,
-    /// Bonding shell width δ: bond forms when contact ≤ r < contact + δ
+    /// Bonding shell half-width δ: particles bond when |d - contact| ≤ δ,
+    /// and only overlap when d < contact - δ
     pub delta: f64,
     /// Temperature T (k=1, so kT = temperature)
     pub temperature: f64,
@@ -36,6 +37,12 @@ pub struct SimConfig {
     /// Harmonic spring stiffness for the relaxation potential
     #[serde(default = "default_spring_k")]
     pub spring_k: f64,
+    /// Cached largest particle radius (computed after deserialization)
+    #[serde(skip)]
+    cached_max_radius: f64,
+    /// Cached largest bonding cutoff (computed after deserialization)
+    #[serde(skip)]
+    cached_max_cutoff: f64,
 }
 
 fn default_angles() -> u32 { 12 }
@@ -44,6 +51,21 @@ fn default_relax_alpha() -> f64 { 0.01 }
 fn default_spring_k() -> f64 { 50.0 }
 
 impl SimConfig {
+    /// Recompute cached derived values. Must be called after deserialization
+    /// or after mutating radii/delta.
+    pub fn init_cache(&mut self) {
+        self.cached_max_radius = self.particle_types.iter().map(|t| t.radius).fold(0.0f64, f64::max);
+        let n = self.n_types();
+        let mut max_c = 0.0f64;
+        for i in 0..n {
+            for j in 0..n {
+                let c = self.cutoff(i, j);
+                if c > max_c { max_c = c; }
+            }
+        }
+        self.cached_max_cutoff = max_c;
+    }
+
     pub fn n_types(&self) -> usize {
         self.particle_types.len()
     }
@@ -67,20 +89,12 @@ impl SimConfig {
     }
 
     pub fn max_radius(&self) -> f64 {
-        self.particle_types.iter().map(|t| t.radius).fold(0.0f64, f64::max)
+        self.cached_max_radius
     }
 
     /// Largest possible bonding cutoff across all type pairs
     pub fn max_cutoff(&self) -> f64 {
-        let n = self.n_types();
-        let mut max = 0.0f64;
-        for i in 0..n {
-            for j in 0..n {
-                let c = self.cutoff(i, j);
-                if c > max { max = c; }
-            }
-        }
-        max
+        self.cached_max_cutoff
     }
 
     /// Attachment rate per candidate site for type t

@@ -55,15 +55,16 @@ struct CrystalApp {
 
 impl CrystalApp {
     fn new() -> Self {
-        let config: SimConfig =
+        let mut config: SimConfig =
             serde_json::from_str(DEFAULT_CONFIG).expect("default config invalid");
+        config.init_cache();
         let colors = config.particle_types.iter().map(|t| parse_color(&t.color)).collect();
         let temperature = config.temperature;
         let mu = config.particle_types.iter().map(|t| t.mu).collect();
         CrystalApp {
             sim: Simulation::new(config),
             running: true,
-            steps_per_frame: 200,
+            steps_per_frame: 500,
             zoom: 20.0,
             pan: Vec2::ZERO,
             colors,
@@ -116,8 +117,9 @@ impl eframe::App for CrystalApp {
                     self.sim.step(self.steps_per_frame);
                 }
                 if ui.button("Reset").clicked() {
-                    let config: SimConfig =
+                    let mut config: SimConfig =
                         serde_json::from_str(DEFAULT_CONFIG).expect("invalid config");
+                    config.init_cache();
                     self.sim = Simulation::new(config);
                     self.pan = Vec2::ZERO;
                 }
@@ -202,8 +204,9 @@ impl eframe::App for CrystalApp {
 
             // Bonds
             if self.show_bonds {
-                for (i, nbrs) in self.sim.neighbors.iter().enumerate() {
-                    for &j in nbrs {
+                for i in 0..self.sim.particles.len() {
+                    let nbrs = self.sim.get_neighbors(i);
+                    for j in nbrs {
                         if j <= i {
                             continue; // draw each bond once
                         }
@@ -236,7 +239,7 @@ impl eframe::App for CrystalApp {
                 {
                     continue;
                 }
-                let screen_r = particle.radius as f32 * self.zoom;
+                let screen_r = (particle.radius - self.sim.config.delta) as f32 * self.zoom;
                 if screen_r < 0.5 {
                     continue;
                 }

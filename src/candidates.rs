@@ -43,20 +43,22 @@ pub fn circle_intersections(a: DVec2, r1: f64, b: DVec2, r2: f64) -> [Option<DVe
 }
 
 /// True if a proposed site at `pos` with radius `rc` hard-core overlaps any
-/// existing particle (center-to-center < σ_i + σ_C).
+/// existing particle (center-to-center < σ_i + σ_C - δ).
 ///
 /// `nearby_indices` should come from a spatial hash query with an appropriate radius;
 /// `particles_pos` and `particles_radius` are parallel slices indexed by those indices.
 pub fn site_has_overlap(
     pos: DVec2,
     rc: f64,
+    delta: f64,
     nearby: &[usize],
     positions: &[DVec2],
     radii: &[f64],
 ) -> bool {
     for &idx in nearby {
         let contact = rc + radii[idx];
-        if pos.distance_squared(positions[idx]) < contact * contact * (1.0 - 1e-9) {
+        let overlap_dist = contact - delta;
+        if overlap_dist > 0.0 && pos.distance_squared(positions[idx]) < overlap_dist * overlap_dist {
             return true;
         }
     }
