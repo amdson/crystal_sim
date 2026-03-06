@@ -31,6 +31,8 @@ pub struct Simulation {
     pub candidates_spatial: SpatialHash, // Spatial hash for candidates, indexed by candidate index
     pub attach_rates: RateCatalog, //Attach rates indexed by candidate index
 
+    pub static_friction: f64,
+
     pub config: SimConfig,
     pub time: f64,
     pub rng: Rng,
@@ -40,6 +42,8 @@ pub struct Simulation {
     pub usages: Vec<u32>,
     /// Reusable boolean mask for active-set relaxation (avoids per-call allocation).
     in_active: Vec<bool>,
+    /// Reusable buffer for spatial hash queries (avoids per-query allocation).
+    query_buf: Vec<usize>,
 }
 
 /*
@@ -66,7 +70,7 @@ impl Simulation {
             candidates: Vec::new(), 
             candidates_spatial: SpatialHash::new(cell_size),  
             attach_rates: RateCatalog::new(), 
-
+            static_friction: config.static_friction,
             time: 0.0,
             rng: Rng::new(config.seed),  
             particle_buf: Vec::new(), 
@@ -74,6 +78,7 @@ impl Simulation {
             timers: (0..TimerEntry::Count as usize).map(|_i| Duration::new(0, 0)).collect(), 
             usages: vec![0; TimerEntry::Count as usize],
             in_active: Vec::new(),
+            query_buf: Vec::new(),
         };
 
         // Seed crystal: one particle of type zero placed at the origin,
@@ -292,22 +297,22 @@ impl Simulation {
             .sum()
     }
 
-    fn site_binding_energy(&self, site: &CandidateSite) -> f64 {
-        let type_c = site.type_id;
-        let rc = self.config.radius(type_c);
-        let pos = site.pos;
-        let query_r = rc + self.config.max_radius() + self.config.delta;
-        let nearby = self.spatial.query(pos.x, pos.y, query_r);
-        nearby
-            .iter()
-            .filter(|&&i| {
-                let d = self.particles[i].pos.distance(pos);
-                let contact = self.particles[i].radius + rc;
-                d >= contact - self.config.delta && d <= contact + self.config.delta
-            })
-            .map(|&i| self.config.epsilon(type_c, self.particles[i].type_id))
-            .sum()
-    }
+    // fn site_binding_energy(&self, site: &CandidateSite) -> f64 {
+    //     let type_c = site.type_id;
+    //     let rc = self.config.radius(type_c);
+    //     let pos = site.pos;
+    //     let query_r = rc + self.config.max_radius() + self.config.delta;
+    //     let nearby = self.spatial.query(pos.x, pos.y, query_r);
+    //     nearby
+    //         .iter()
+    //         .filter(|&&i| {
+    //             let d = self.particles[i].pos.distance(pos);
+    //             let contact = self.particles[i].radius + rc;
+    //             d >= contact - self.config.delta && d <= contact + self.config.delta
+    //         })
+    //         .map(|&i| self.config.epsilon(type_c, self.particles[i].type_id))
+    //         .sum()
+    // }
 
     fn add_candidate(&mut self, site: CandidateSite) {
         let type_c = site.type_id;
@@ -324,44 +329,71 @@ impl Simulation {
     /// Remove stale candidates near `center`, then regenerate from scratch for
     /// all particles within `radius` of `center`.
     fn regen_candidates_near(&mut self, center: DVec2, radius: f64) {
-        let r_sq = radius * radius;
+        self.regen_candidates_batch(&[(center, radius)]);
+    }
 
-        let nearby_sites = self.candidates_spatial.query(center.x, center.y, radius + self.config.max_cutoff());
-        let to_delete: Vec<usize> = nearby_sites
-            .iter()
-            .filter(|&&site_idx| {
-                site_idx < self.candidates.len()
+    /// Batch version: delete and regenerate candidate sites for multiple
+    /// (center, radius) regions at once.  Merges all deletion, focal, and
+    /// overlap queries so overlapping regions don't duplicate work.
+    fn regen_candidates_batch(&mut self, regions: &[(DVec2, f64)]) {
+        if regions.is_empty() {
+            return;
+        }
+        
+        // ── 1. Batch-delete stale candidates across all regions ───────────
+        let mut to_delete: Vec<usize> = Vec::new();
+        for &(center, radius) in regions {
+            let r_sq = radius * radius;
+            self.candidates_spatial.query_into(
+                center.x, center.y,
+                radius + self.config.max_cutoff(),
+                &mut self.query_buf,
+            );
+            for &site_idx in &self.query_buf {
+                if site_idx < self.candidates.len()
                     && self.candidates[site_idx].pos.distance_squared(center) < r_sq
-            })
-            .copied()
-            .collect();
+                {
+                    to_delete.push(site_idx);
+                }
+            }
+        }
+        to_delete.sort_unstable();
+        to_delete.dedup();
         self.del_candidates_batch(to_delete);
 
-        // 2. Find particles whose neighbourhood overlaps the affected region.
-        let search_r = radius + self.config.max_cutoff() * 2.0;
-        let focal: Vec<usize> = self
-            .spatial
-            .query(center.x, center.y, search_r)
-            .into_iter()
-            .filter(|&i| i < self.particles.len())
-            .collect();
+        // ── 2. Build merged focal set (particles near any region) ─────────
+        let mut focal: Vec<usize> = Vec::new();
+        for &(center, radius) in regions {
+            let search_r = radius + self.config.max_cutoff() * 2.0;
+            self.spatial.query_into(center.x, center.y, search_r, &mut self.query_buf);
+            for &i in &self.query_buf {
+                if i < self.particles.len() {
+                    focal.push(i);
+                }
+            }
+        }
+        focal.sort_unstable();
+        focal.dedup();
 
-        // 3. Build overlap-check arrays once from a wider query that covers all
-        //    particles that could possibly overlap any candidate site generated
-        //    from focal particles.  A site is at most ~2*max_radius from a focal
-        //    particle, and an overlapper is at most ~2*max_radius from the site.
-        let overlap_r = search_r + 4.0 * self.config.max_radius();
-        let overlap_set: Vec<usize> = self
-            .spatial
-            .query(center.x, center.y, overlap_r)
-            .into_iter()
-            .filter(|&i| i < self.particles.len())
-            .collect();
+        // ── 3. Build merged overlap-check arrays ──────────────────────────
+        let mut overlap_set: Vec<usize> = Vec::new();
+        for &(center, radius) in regions {
+            let search_r = radius + self.config.max_cutoff() * 2.0;
+            let overlap_r = search_r + 4.0 * self.config.max_radius();
+            self.spatial.query_into(center.x, center.y, overlap_r, &mut self.query_buf);
+            for &i in &self.query_buf {
+                if i < self.particles.len() {
+                    overlap_set.push(i);
+                }
+            }
+        }
+        overlap_set.sort_unstable();
+        overlap_set.dedup();
         let overlap_pos: Vec<DVec2> = overlap_set.iter().map(|&i| self.particles[i].pos).collect();
         let overlap_rad: Vec<f64> = overlap_set.iter().map(|&i| self.particles[i].radius).collect();
         let overlap_idx: Vec<usize> = (0..overlap_set.len()).collect();
 
-        // 4. For each focal particle A and each candidate type C, generate sites.
+        // ── 4. For each focal particle A and each candidate type C, generate sites.
         for &a_idx in &focal {
             let a_pos = self.particles[a_idx].pos;
             let a_r = self.particles[a_idx].radius;
@@ -371,7 +403,8 @@ impl Simulation {
 
                 // All particles close enough to A that C can touch both
                 let pair_search = a_r + rc + self.config.max_radius() + rc + self.config.delta;
-                let nearby_indices = self.spatial.query(a_pos.x, a_pos.y, pair_search);
+                self.spatial.query_into(a_pos.x, a_pos.y, pair_search, &mut self.query_buf);
+                let nearby_indices: Vec<usize> = self.query_buf.clone();
 
                 let mut found_pair = false;
 
@@ -388,7 +421,6 @@ impl Simulation {
                     for maybe_pt in circle_intersections(a_pos, r_ac, b_pos, r_bc) {
                         let Some(site_pos) = maybe_pt else { continue };
 
-                        // Must be within bonding shell of both A and B
                         let da = a_pos.distance(site_pos);
                         let db = b_pos.distance(site_pos);
                         if da < (a_r + rc) - self.config.delta
@@ -407,16 +439,14 @@ impl Simulation {
                         }
                         self.add_candidate(CandidateSite { pos: site_pos, type_id: type_c });
                         found_pair = true;
-                        
                     }
                 }
 
                 // Isolated particle: generate arc sites if no bonded neighbours at all
                 if !found_pair {
                     let bonded_cutoff = a_r + self.config.max_radius() + self.config.delta;
-                    let has_bonded_neighbor = self
-                        .spatial
-                        .query(a_pos.x, a_pos.y, bonded_cutoff)
+                    self.spatial.query_into(a_pos.x, a_pos.y, bonded_cutoff, &mut self.query_buf);
+                    let has_bonded_neighbor = self.query_buf
                         .iter()
                         .any(|&ni| {
                             if ni == a_idx || ni >= self.particles.len() {
@@ -435,7 +465,7 @@ impl Simulation {
                             let site_pos =
                                 a_pos + DVec2::new(theta.cos(), theta.sin()) * r_contact;
                             if site_has_overlap(site_pos, rc, self.config.delta, &overlap_idx, &overlap_pos, &overlap_rad) {
-                                continue; 
+                                continue;
                             }
                             self.add_candidate(CandidateSite { pos: site_pos, type_id: type_c });
                         }
@@ -516,7 +546,7 @@ impl Simulation {
 
         let k = self.config.spring_k;
         let alpha = self.config.relax_alpha;
-        let static_friction = self.config.max_radius() * 0.05;
+        let static_friction = self.static_friction;
         let delta = self.config.delta;
         let max_active: usize = 64; // cap to prevent runaway growth
 
@@ -554,11 +584,12 @@ impl Simulation {
                 let ri = self.particles[idx].radius;
 
                 let query_r = ri + self.config.max_radius() + delta + 1e-6;
-                let nearby = self.spatial.query(pos.x, pos.y, query_r);
+                self.spatial.query_into(pos.x, pos.y, query_r, &mut self.query_buf);
 
                 let mut force = DVec2::ZERO;
 
-                for &j in &nearby {
+                for j_pos in 0..self.query_buf.len() {
+                    let j = self.query_buf[j_pos];
                     if j == idx || j >= n_particles {
                         continue;
                     }
@@ -645,7 +676,6 @@ impl Simulation {
         }
 
         // ── Post-relaxation: refresh rates and candidate sites ────────────
-
         // Collect every particle whose bonds may have changed (sorted + dedup, no HashSet)
         let mut rate_indices: Vec<usize> = Vec::new();
         for &idx in &active {
@@ -660,27 +690,15 @@ impl Simulation {
 
         // Regenerate candidates near every active particle (current + initial positions)
         let regen_r = self.config.max_cutoff() * 2.0;
-        let mut regen_centers: Vec<DVec2> =
+        let mut regen_regions: Vec<(DVec2, f64)> =
             Vec::with_capacity(active.len() + initial_positions.len());
         for &idx in &active {
-            regen_centers.push(self.particles[idx].pos);
+            regen_regions.push((self.particles[idx].pos, regen_r));
         }
-        regen_centers.extend_from_slice(&initial_positions);
-
-        // Deduplicate nearby centers to avoid redundant work
-        let dedup_r_sq = (regen_r * 0.5) * (regen_r * 0.5);
-        let mut unique_centers: Vec<DVec2> = Vec::new();
-        for c in &regen_centers {
-            if unique_centers
-                .iter()
-                .all(|u| u.distance_squared(*c) > dedup_r_sq)
-            {
-                unique_centers.push(*c);
-            }
+        for &pos in &initial_positions {
+            regen_regions.push((pos, regen_r));
         }
-        for center in unique_centers {
-            self.regen_candidates_near(center, regen_r);
-        }
+        self.regen_candidates_batch(&regen_regions);
 
         // Reset the in_active flags for reuse next call
         for &idx in &active {

@@ -37,6 +37,10 @@ pub struct SimConfig {
     /// Harmonic spring stiffness for the relaxation potential
     #[serde(default = "default_spring_k")]
     pub spring_k: f64,
+    #[serde(default = "default_static_friction")]
+    pub static_friction: f64,
+    #[serde(default = "default_steps_per_frame")]
+    pub steps_per_frame: u32,
     /// Cached largest particle radius (computed after deserialization)
     #[serde(skip)]
     cached_max_radius: f64,
@@ -46,10 +50,11 @@ pub struct SimConfig {
 }
 
 fn default_angles() -> u32 { 12 }
+fn default_steps_per_frame() -> u32 { 150 }
 fn default_relax_steps() -> u32 { 30 }
 fn default_relax_alpha() -> f64 { 0.01 }
 fn default_spring_k() -> f64 { 50.0 }
-
+fn default_static_friction() -> f64 { 0.01 }
 impl SimConfig {
     /// Recompute cached derived values. Must be called after deserialization
     /// or after mutating radii/delta.

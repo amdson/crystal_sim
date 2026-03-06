@@ -32,22 +32,41 @@ impl SpatialHash {
         }
     }
 
+    /// Remove multiple (idx, x, y) entries in one pass, batching by cell key
+    /// to avoid repeated HashMap lookups for entries in the same cell.
+    pub fn batch_remove(&mut self, entries: &[(usize, f64, f64)]) {
+        for &(idx, x, y) in entries {
+            let k = self.key(x, y);
+            if let Some(v) = self.cells.get_mut(&k) {
+                if let Some(p) = v.iter().position(|&i| i == idx) {
+                    v.swap_remove(p);
+                }
+            }
+        }
+    }
+
     /// All particle indices whose cell overlaps a circle of `radius` around (cx, cy).
     /// Caller must do final distance filtering.
     pub fn query(&self, cx: f64, cy: f64, radius: f64) -> Vec<usize> {
+        let mut result = Vec::new();
+        self.query_into(cx, cy, radius, &mut result);
+        result
+    }
+
+    /// Like `query`, but appends into a caller-provided buffer (cleared first).
+    pub fn query_into(&self, cx: f64, cy: f64, radius: f64, out: &mut Vec<usize>) {
+        out.clear();
         let min_gx = ((cx - radius) / self.cell_size).floor() as i64;
         let max_gx = ((cx + radius) / self.cell_size).floor() as i64;
         let min_gy = ((cy - radius) / self.cell_size).floor() as i64;
         let max_gy = ((cy + radius) / self.cell_size).floor() as i64;
 
-        let mut result = Vec::new();
         for gx in min_gx..=max_gx {
             for gy in min_gy..=max_gy {
                 if let Some(v) = self.cells.get(&(gx, gy)) {
-                    result.extend_from_slice(v);
+                    out.extend_from_slice(v);
                 }
             }
         }
-        result
     }
 }

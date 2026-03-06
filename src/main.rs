@@ -43,6 +43,7 @@ fn parse_color(hex: &str) -> Color32 {
 
 struct CrystalApp {
     sim: Simulation,
+    config_string: String,
     running: bool,
     steps_per_frame: u32,
     zoom: f32,
@@ -54,17 +55,19 @@ struct CrystalApp {
 }
 
 impl CrystalApp {
-    fn new() -> Self {
+    fn new(config_string: String) -> Self {
         let mut config: SimConfig =
-            serde_json::from_str(DEFAULT_CONFIG).expect("default config invalid");
+            serde_json::from_str(&config_string).expect("config invalid");
         config.init_cache();
         let colors = config.particle_types.iter().map(|t| parse_color(&t.color)).collect();
         let temperature = config.temperature;
         let mu = config.particle_types.iter().map(|t| t.mu).collect();
+        let steps_per_frame = config.steps_per_frame;
         CrystalApp {
             sim: Simulation::new(config),
+            config_string,
             running: true,
-            steps_per_frame: 500,
+            steps_per_frame: steps_per_frame,
             zoom: 20.0,
             pan: Vec2::ZERO,
             colors,
@@ -118,7 +121,7 @@ impl eframe::App for CrystalApp {
                 }
                 if ui.button("Reset").clicked() {
                     let mut config: SimConfig =
-                        serde_json::from_str(DEFAULT_CONFIG).expect("invalid config");
+                        serde_json::from_str(&self.config_string).expect("invalid config");
                     config.init_cache();
                     self.sim = Simulation::new(config);
                     self.pan = Vec2::ZERO;
@@ -265,6 +268,13 @@ impl eframe::App for CrystalApp {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let config_string = if args.len() > 1 {
+        std::fs::read_to_string(&args[1]).expect("Failed to read config file")
+    } else {
+        DEFAULT_CONFIG.to_string()
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Crystal Growth Simulator")
@@ -274,7 +284,7 @@ fn main() {
     eframe::run_native(
         "Crystal Growth Simulator",
         options,
-        Box::new(|_cc| Ok(Box::new(CrystalApp::new()))),
+        Box::new(move |_cc| Ok(Box::new(CrystalApp::new(config_string)))),
     )
     .expect("failed to launch GUI");
 }
