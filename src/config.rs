@@ -25,9 +25,12 @@ pub struct SimConfig {
     pub nu: f64,
     /// RNG seed
     pub seed: u64,
-    /// How many arc angles to sample around isolated particles
+    /// How many arc angles to consider around each particle (all 16 are evaluated, best are selected)
     #[serde(default = "default_angles")]
     pub num_isolated_angles: u32,
+    /// Max arc sites submitted per (particle, candidate-type) pair after angular filtering
+    #[serde(default = "default_max_arc_sites")]
+    pub max_arc_sites_per_type: usize,
     /// Steepest-descent steps run after each attachment (0 = disabled)
     #[serde(default = "default_relax_steps")]
     pub relax_steps: u32,
@@ -49,7 +52,8 @@ pub struct SimConfig {
     cached_max_cutoff: f64,
 }
 
-fn default_angles() -> u32 { 12 }
+fn default_angles() -> u32 { 16 }
+fn default_max_arc_sites() -> usize { 6 }
 fn default_steps_per_frame() -> u32 { 150 }
 fn default_relax_steps() -> u32 { 30 }
 fn default_relax_alpha() -> f64 { 0.01 }

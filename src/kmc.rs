@@ -56,7 +56,7 @@ Simulation steps
 - If remove:
     - Remove particle
     - Replace influenced candidates
-*/
+*/ 
 
 impl Simulation {
     pub fn new(mut config: SimConfig) -> Self {
@@ -398,15 +398,27 @@ impl Simulation {
             let a_pos = self.particles[a_idx].pos;
             let a_r = self.particles[a_idx].radius;
 
+            // Precompute bonded neighbor angles for A (used by arc site filtering below)
+            let bonded_cutoff = a_r + self.config.max_radius() + self.config.delta;
+            self.spatial.query_into(a_pos.x, a_pos.y, bonded_cutoff, &mut self.query_buf);
+            let bonded_angles: Vec<f64> = self.query_buf.iter()
+                .filter_map(|&ni| {
+                    if ni == a_idx || ni >= self.particles.len() { return None; }
+                    let other = &self.particles[ni];
+                    let d = a_pos.distance(other.pos);
+                    if d < a_r + other.radius + self.config.delta {
+                        Some(f64::atan2(other.pos.y - a_pos.y, other.pos.x - a_pos.x))
+                    } else { None }
+                })
+                .collect();
+
             for type_c in 0..self.config.n_types() {
                 let rc = self.config.radius(type_c);
 
-                // All particles close enough to A that C can touch both
+                // ── 4a. Intersection sites: C touches both A and some neighbor B ──
                 let pair_search = a_r + rc + self.config.max_radius() + rc + self.config.delta;
                 self.spatial.query_into(a_pos.x, a_pos.y, pair_search, &mut self.query_buf);
                 let nearby_indices: Vec<usize> = self.query_buf.clone();
-
-                let mut found_pair = false;
 
                 for &b_idx in &nearby_indices {
                     if b_idx <= a_idx || b_idx >= self.particles.len() {
@@ -438,37 +450,44 @@ impl Simulation {
                             continue;
                         }
                         self.add_candidate(CandidateSite { pos: site_pos, type_id: type_c });
-                        found_pair = true;
                     }
                 }
 
-                // Isolated particle: generate arc sites if no bonded neighbours at all
-                if !found_pair {
-                    let bonded_cutoff = a_r + self.config.max_radius() + self.config.delta;
-                    self.spatial.query_into(a_pos.x, a_pos.y, bonded_cutoff, &mut self.query_buf);
-                    let has_bonded_neighbor = self.query_buf
-                        .iter()
-                        .any(|&ni| {
-                            if ni == a_idx || ni >= self.particles.len() {
-                                return false;
-                            }
-                            let other = &self.particles[ni];
-                            let d = a_pos.distance(other.pos);
-                            d < a_r + other.radius + self.config.delta
-                        });
+                // ── 4b. Arc sites: C touches only A (single-contact bonding) ──
+                // Generated for all particles (not just isolated ones).
+                // Angles near bonded neighbors are excluded since those regions are
+                // already covered by intersection sites above.
+                let n_ang = self.config.num_isolated_angles;
+                let exclusion = TAU / n_ang as f64; // one angular step
+                let r_contact = a_r + rc;
+                let max_arc = self.config.max_arc_sites_per_type;
 
-                    if !has_bonded_neighbor {
-                        let n_ang = self.config.num_isolated_angles;
-                        let r_contact = a_r + rc;
-                        for k in 0..n_ang {
-                            let theta = (k as f64) * TAU / (n_ang as f64);
-                            let site_pos =
-                                a_pos + DVec2::new(theta.cos(), theta.sin()) * r_contact;
-                            if site_has_overlap(site_pos, rc, self.config.delta, &overlap_idx, &overlap_pos, &overlap_rad) {
-                                continue;
-                            }
-                            self.add_candidate(CandidateSite { pos: site_pos, type_id: type_c });
-                        }
+                let mut arc_candidates: Vec<DVec2> = Vec::new();
+                for k in 0..n_ang {
+                    let theta = (k as f64) * TAU / (n_ang as f64);
+                    // Skip angles within `exclusion` of any bonded neighbor direction
+                    let blocked = bonded_angles.iter().any(|&phi| {
+                        let diff = (theta - phi + TAU).rem_euclid(TAU);
+                        diff < exclusion || diff > TAU - exclusion
+                    });
+                    if blocked { continue; }
+                    let site_pos = a_pos + DVec2::new(theta.cos(), theta.sin()) * r_contact;
+                    if site_has_overlap(site_pos, rc, self.config.delta, &overlap_idx, &overlap_pos, &overlap_rad) {
+                        continue;
+                    }
+                    arc_candidates.push(site_pos);
+                }
+
+                if arc_candidates.len() <= max_arc {
+                    for pos in arc_candidates {
+                        self.add_candidate(CandidateSite { pos, type_id: type_c });
+                    }
+                } else {
+                    // Select max_arc sites spread evenly across the candidate list
+                    let step = arc_candidates.len() as f64 / max_arc as f64;
+                    for i in 0..max_arc {
+                        let idx = (i as f64 * step) as usize;
+                        self.add_candidate(CandidateSite { pos: arc_candidates[idx], type_id: type_c });
                     }
                 }
             }
@@ -582,6 +601,7 @@ impl Simulation {
             for &idx in &active[..n_active] {
                 let pos = self.particles[idx].pos;
                 let ri = self.particles[idx].radius;
+                let type_i = self.particles[idx].type_id;
 
                 let query_r = ri + self.config.max_radius() + delta + 1e-6;
                 self.spatial.query_into(pos.x, pos.y, query_r, &mut self.query_buf);
@@ -602,17 +622,27 @@ impl Simulation {
                     let r_hat = r_vec / r;
                     let r_contact = ri + self.particles[j].radius;
 
-                    // Unified harmonic spring for any pair within interaction range.
-                    // F = 2k(r − r_contact) r̂
-                    //   positive (attractive) when r > r_contact
-                    //   negative (repulsive)  when r < r_contact
                     if r <= r_contact + delta {
+                        // Unified harmonic spring: F = 2k(r − r_contact) r̂
+                        //   attractive when r > r_contact, repulsive when r < r_contact
                         let f = (2.0 * k * (r - r_contact)) * r_hat;
                         force += f;
 
-                        // Track reaction force on non-active neighbors
+                        // For repulsive pairs (ε < 0), add a force derived from
+                        // U = −ε·((r_contact + δ − r)/δ)², which costs energy when
+                        // the pair is in the bonding shell and goes to zero at r_contact + δ.
+                        // F_extra = ε · 2(r_contact + δ − r)/δ² · r̂  (negative → repulsive)
+                        let eps = self.config.epsilon(type_i, self.particles[j].type_id);
+                        let mut f_nb = -f; // reaction for spring
+                        if eps < 0.0 {
+                            let f_rep = (2.0 * (r_contact + delta - r)) * r_hat;
+                            force += f_rep;
+                            f_nb -= f_rep; // reaction for repulsion
+                        }
+
+                        // Track total reaction force on non-active neighbors
                         if !self.in_active[j] {
-                            touched.push((j, -f)); // Newton's third law
+                            touched.push((j, f_nb));
                         }
                     }
                 }
