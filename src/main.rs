@@ -157,10 +157,10 @@ impl eframe::App for CrystalApp {
                     ui.colored_label(color, format!("mu type {}", i));
                 });
                 let mut m = *mu;
-                if ui.add(egui::Slider::new(&mut m, 0.0..=8.0).step_by(0.1)).changed() {
-                    *mu = m;
-                    self.sim.set_chemical_potential(i, m);
-                }
+                // if ui.add(egui::Slider::new(&mut m, 0.0..=8.0).step_by(0.1)).changed() {
+                //     *mu = m;
+                //     self.sim.set_chemical_potential(i, m);
+                // }
             }
 
             ui.separator();

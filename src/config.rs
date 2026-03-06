@@ -40,6 +40,9 @@ pub struct SimConfig {
     /// Harmonic spring stiffness for the relaxation potential
     #[serde(default = "default_spring_k")]
     pub spring_k: f64,
+    /// LJ cutoff as a multiple of r_contact (e.g. 2.0 → cutoff at 2× contact distance)
+    #[serde(default = "default_lj_cutoff_factor")]
+    pub lj_cutoff_factor: f64,
     #[serde(default = "default_static_friction")]
     pub static_friction: f64,
     #[serde(default = "default_steps_per_frame")]
@@ -58,6 +61,7 @@ fn default_steps_per_frame() -> u32 { 150 }
 fn default_relax_steps() -> u32 { 30 }
 fn default_relax_alpha() -> f64 { 0.01 }
 fn default_spring_k() -> f64 { 50.0 }
+fn default_lj_cutoff_factor() -> f64 { 2.0 }
 fn default_static_friction() -> f64 { 0.01 }
 impl SimConfig {
     /// Recompute cached derived values. Must be called after deserialization
@@ -107,12 +111,12 @@ impl SimConfig {
     }
 
     /// Attachment rate per candidate site for type t
-    pub fn attach_rate(&self, type_id: usize) -> f64 {
-        self.nu * (self.particle_types[type_id].mu / self.temperature).exp()
+    pub fn attach_rate(&self, type_id: usize, e_bind: f64) -> f64 {
+        self.nu * ( (self.particle_types[type_id].mu + (e_bind / 2.0) ) / self.temperature).exp()
     }
 
     /// Detachment rate given a binding energy E_bind
     pub fn detach_rate(&self, e_bind: f64) -> f64 {
-        self.nu * ((-e_bind) / self.temperature).exp()
+        self.nu * ( (-e_bind / 2.0) / self.temperature).exp()
     }
 }

@@ -1,5 +1,6 @@
 mod candidates;
 pub mod config;
+pub mod forces;
 pub mod kmc;
 pub mod particle;
 mod rates;
@@ -65,10 +66,10 @@ impl CrystalSim {
         self.inner.set_temperature(t);
     }
 
-    /// Update chemical potential for a particle type at runtime.
-    pub fn set_chemical_potential(&mut self, type_id: u32, mu: f64) {
-        self.inner.set_chemical_potential(type_id as usize, mu);
-    }
+    // /// Update chemical potential for a particle type at runtime.
+    // pub fn set_chemical_potential(&mut self, type_id: u32, mu: f64) {
+    //     self.inner.set_chemical_potential(type_id as usize, mu);
+    // }
 
     /// JSON array of per-type metadata: [{"color":"#hex","radius":r}, ...]
     pub fn type_metadata_json(&self) -> String {

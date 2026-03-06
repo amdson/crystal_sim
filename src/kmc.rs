@@ -3,6 +3,7 @@ use glam::DVec2;
 
 use crate::candidates::{CandidateSite, circle_intersections, site_has_overlap};
 use crate::config::SimConfig;
+use crate::forces::lj_force_vec;
 use crate::particle::Particle;
 use crate::rates::RateCatalog;
 use crate::rng::Rng;
@@ -297,32 +298,32 @@ impl Simulation {
             .sum()
     }
 
-    // fn site_binding_energy(&self, site: &CandidateSite) -> f64 {
-    //     let type_c = site.type_id;
-    //     let rc = self.config.radius(type_c);
-    //     let pos = site.pos;
-    //     let query_r = rc + self.config.max_radius() + self.config.delta;
-    //     let nearby = self.spatial.query(pos.x, pos.y, query_r);
-    //     nearby
-    //         .iter()
-    //         .filter(|&&i| {
-    //             let d = self.particles[i].pos.distance(pos);
-    //             let contact = self.particles[i].radius + rc;
-    //             d >= contact - self.config.delta && d <= contact + self.config.delta
-    //         })
-    //         .map(|&i| self.config.epsilon(type_c, self.particles[i].type_id))
-    //         .sum()
-    // }
+    fn site_binding_energy(&self, site: &CandidateSite) -> f64 {
+        let type_c = site.type_id;
+        let rc = self.config.radius(type_c);
+        let pos = site.pos;
+        let query_r = rc + self.config.max_radius() + self.config.delta;
+        let nearby = self.spatial.query(pos.x, pos.y, query_r);
+        nearby
+            .iter()
+            .filter(|&&i| {
+                let d = self.particles[i].pos.distance(pos);
+                let contact = self.particles[i].radius + rc;
+                d >= contact - self.config.delta && d <= contact + self.config.delta
+            })
+            .map(|&i| self.config.epsilon(type_c, self.particles[i].type_id))
+            .sum()
+    }
 
     fn add_candidate(&mut self, site: CandidateSite) {
         let type_c = site.type_id;
         let pos = site.pos;
+        let binding_energy = self.site_binding_energy(&site); 
+
         self.candidates.push(site);
         let idx = self.candidates.len() - 1;
-
         self.candidates_spatial.insert(idx, pos.x, pos.y);
-
-        let rate = self.config.attach_rate(type_c); 
+        let rate = self.config.attach_rate(type_c, binding_energy); 
         self.attach_rates.add_rate(rate);
     }
         
@@ -529,18 +530,18 @@ impl Simulation {
         }
     }
 
-    pub fn set_chemical_potential(&mut self, type_id: usize, mu: f64) {
-        if type_id < self.config.n_types() {
-            self.config.particle_types[type_id].mu = mu;
-            // Update attach rates for all candidates of this type
-            let new_rate = self.config.attach_rate(type_id);
-            for i in 0..self.candidates.len() {
-                if self.candidates[i].type_id == type_id {
-                    self.attach_rates.set_rate(i, new_rate);
-                }
-            }
-        }
-    }
+    // pub fn set_chemical_potential(&mut self, type_id: usize, mu: f64) {
+    //     if type_id < self.config.n_types() {
+    //         self.config.particle_types[type_id].mu = mu;
+    //         // Update attach rates for all candidates of this type
+    //         let new_rate = self.config.attach_rate(type_id);
+    //         for i in 0..self.candidates.len() {
+    //             if self.candidates[i].type_id == type_id {
+    //                 self.attach_rates.set_rate(i, new_rate);
+    //             }
+    //         }
+    //     }
+    // }
 
     // ── Post-attachment relaxation ────────────────────────────────────────────
 
@@ -562,12 +563,9 @@ impl Simulation {
         if self.config.relax_steps == 0 {
             return;
         }
-
-        let k = self.config.spring_k;
         let alpha = self.config.relax_alpha;
         let static_friction = self.static_friction;
-        let delta = self.config.delta;
-        let max_active: usize = 64; // cap to prevent runaway growth
+        let max_active: usize = 256; // cap to prevent runaway growth
 
         let n_particles = self.particles.len();
         let mut active: Vec<usize> = vec![new_idx];
@@ -586,7 +584,7 @@ impl Simulation {
         let mut touched: Vec<(usize, DVec2)> = Vec::new();
         let mut moved: Vec<(usize, DVec2)> = Vec::new();
         let mut agg: Vec<(usize, DVec2)> = Vec::new();
-
+        
         for _ in 0..self.config.relax_steps {
             let n_active = active.len();
 
@@ -603,7 +601,8 @@ impl Simulation {
                 let ri = self.particles[idx].radius;
                 let type_i = self.particles[idx].type_id;
 
-                let query_r = ri + self.config.max_radius() + delta + 1e-6;
+                let lj_cutoff_factor = self.config.lj_cutoff_factor;
+                let query_r = ri + self.config.max_radius() * lj_cutoff_factor + 1e-6;
                 self.spatial.query_into(pos.x, pos.y, query_r, &mut self.query_buf);
 
                 let mut force = DVec2::ZERO;
@@ -615,34 +614,15 @@ impl Simulation {
                     }
 
                     let r_vec = self.particles[j].pos - pos;
-                    let r = r_vec.length();
-                    if r < 1e-12 {
-                        continue;
-                    }
-                    let r_hat = r_vec / r;
                     let r_contact = ri + self.particles[j].radius;
+                    let r_cut = r_contact * lj_cutoff_factor;
+                    // let eps = self.config.epsilon(type_i, self.particles[j].type_id);
 
-                    if r <= r_contact + delta {
-                        // Unified harmonic spring: F = 2k(r − r_contact) r̂
-                        //   attractive when r > r_contact, repulsive when r < r_contact
-                        let f = (2.0 * k * (r - r_contact)) * r_hat;
+                    let f = -lj_force_vec(r_vec, r_contact, 1.0, r_cut);
+                    if f != DVec2::ZERO {
                         force += f;
-
-                        // For repulsive pairs (ε < 0), add a force derived from
-                        // U = −ε·((r_contact + δ − r)/δ)², which costs energy when
-                        // the pair is in the bonding shell and goes to zero at r_contact + δ.
-                        // F_extra = ε · 2(r_contact + δ − r)/δ² · r̂  (negative → repulsive)
-                        let eps = self.config.epsilon(type_i, self.particles[j].type_id);
-                        let mut f_nb = -f; // reaction for spring
-                        if eps < 0.0 {
-                            let f_rep = (2.0 * (r_contact + delta - r)) * r_hat;
-                            force += f_rep;
-                            f_nb -= f_rep; // reaction for repulsion
-                        }
-
-                        // Track total reaction force on non-active neighbors
                         if !self.in_active[j] {
-                            touched.push((j, f_nb));
+                            touched.push((j, -f)); // reaction force (Newton's 3rd law)
                         }
                     }
                 }
@@ -662,10 +642,12 @@ impl Simulation {
             moved.clear();
 
             // Apply Jacobi moves to all currently active particles
+            let mut converged = true; 
             for i in 0..n_active {
                 let idx = active[i];
                 moved.push((idx, old_positions[i]));
                 self.particles[idx].pos = old_positions[i] + alpha * forces[i];
+                converged = converged && (forces[i].length_squared() < static_friction*static_friction); 
             }
 
             // Aggregate reaction forces on each touched neighbor, activate if
@@ -693,6 +675,7 @@ impl Simulation {
                         self.in_active[nb_idx] = true;
                         active.push(nb_idx);
                         moved.push((nb_idx, old_pos));
+                        converged = false; 
                     }
                 }
             }
@@ -702,6 +685,9 @@ impl Simulation {
                 self.spatial.remove(idx, old_pos.x, old_pos.y);
                 let new_pos = self.particles[idx].pos;
                 self.spatial.insert(idx, new_pos.x, new_pos.y);
+            }
+            if converged {
+                break; 
             }
         }
 
