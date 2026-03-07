@@ -47,6 +47,8 @@ pub struct SimConfig {
     pub static_friction: f64,
     #[serde(default = "default_steps_per_frame")]
     pub steps_per_frame: u32,
+    #[serde(default = "default_relax_damping")]
+    pub relax_damping: f64,
     /// Cached largest particle radius (computed after deserialization)
     #[serde(skip)]
     cached_max_radius: f64,
@@ -63,6 +65,8 @@ fn default_relax_alpha() -> f64 { 0.01 }
 fn default_spring_k() -> f64 { 50.0 }
 fn default_lj_cutoff_factor() -> f64 { 2.0 }
 fn default_static_friction() -> f64 { 0.01 }
+fn default_relax_damping() -> f64 { 0.8 }
+
 impl SimConfig {
     /// Recompute cached derived values. Must be called after deserialization
     /// or after mutating radii/delta.

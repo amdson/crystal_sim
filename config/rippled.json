@@ -1,0 +1,19 @@
+{
+    "particle_types": [
+        {"radius": 0.5, "color": "#4488ff", "mu": 3.5},
+        {"radius": 0.5, "color": "#ff6644", "mu": 3.5}, 
+        {"radius": 0.5, "color": "#0cee44", "mu": 3.5}, 
+        {"radius": 0.5, "color": "#ff44ff", "mu": 3.5}
+    ],
+    "epsilon": [[-10.0, 1.0, -10.0, 1.0], [1.0, -10.0, 1.0, -10.0], 
+                [-10.0, 1.0, -10.0, 1.0], [1.0, -10.0, 1.0, -10.0]],
+    "delta": 0.1,
+    "temperature": 0.5,
+    "nu": 1.0,
+    "seed": 42,
+    "num_isolated_angles": 16,
+    "relax_steps": 10,
+    "relax_alpha": 0.01,
+    "spring_k": 10.0,
+    "steps_per_frame": 50
+}
