@@ -564,8 +564,11 @@ impl Simulation {
             return;
         }
         let alpha = self.config.relax_alpha;
+        let damping = self.config.relax_damping;
         let static_friction = self.static_friction;
         let max_active: usize = 256; // cap to prevent runaway growth
+        let lj_cutoff_factor = self.config.lj_cutoff_factor;
+        let max_radius_scaled = self.config.max_radius() * lj_cutoff_factor + 1e-6;
 
         let n_particles = self.particles.len();
         let mut active: Vec<usize> = vec![new_idx];
@@ -580,7 +583,8 @@ impl Simulation {
 
         // Reusable buffers – cleared each step instead of reallocated
         let mut old_positions: Vec<DVec2> = Vec::new();
-        let mut forces: Vec<DVec2> = Vec::new();
+        let mut forces: Vec<DVec2> = vec![DVec2::ZERO; max_active];
+        let mut velocities: Vec<DVec2> = vec![DVec2::ZERO; max_active];
         let mut touched: Vec<(usize, DVec2)> = Vec::new();
         let mut moved: Vec<(usize, DVec2)> = Vec::new();
         let mut agg: Vec<(usize, DVec2)> = Vec::new();
@@ -593,16 +597,13 @@ impl Simulation {
             old_positions.extend(active[..n_active].iter().map(|&idx| self.particles[idx].pos));
 
             // Compute forces on each active particle
-            forces.clear();
             touched.clear();
 
-            for &idx in &active[..n_active] {
+            for (ai, &idx) in active[..n_active].iter().enumerate() {
                 let pos = self.particles[idx].pos;
                 let ri = self.particles[idx].radius;
-                let type_i = self.particles[idx].type_id;
 
-                let lj_cutoff_factor = self.config.lj_cutoff_factor;
-                let query_r = ri + self.config.max_radius() * lj_cutoff_factor + 1e-6;
+                let query_r = ri + max_radius_scaled;
                 self.spatial.query_into(pos.x, pos.y, query_r, &mut self.query_buf);
 
                 let mut force = DVec2::ZERO;
@@ -628,26 +629,41 @@ impl Simulation {
                 }
 
                 // Apply static friction: reduce magnitude, clamp at zero
+                force = force.clamp_length(0.0, 3.0);
                 let f_mag = force.length();
                 if f_mag > static_friction {
                     force *= (f_mag - static_friction) / f_mag;
                 } else {
                     force = DVec2::ZERO;
                 }
+                
 
-                forces.push(force);
+                forces[ai] = force;
             }
 
             // Track all particles that moved this step for spatial hash update
             moved.clear();
 
-            // Apply Jacobi moves to all currently active particles
-            let mut converged = true; 
+            // Apply damped-velocity Jacobi moves to all currently active particles.
+            // FIRE-style reset: if velocity opposes force, zero the velocity to
+            // prevent oscillation and let the solver restart from steepest descent.
+            let mut converged = true;
             for i in 0..n_active {
                 let idx = active[i];
                 moved.push((idx, old_positions[i]));
-                self.particles[idx].pos = old_positions[i] + alpha * forces[i];
-                converged = converged && (forces[i].length_squared() < static_friction*static_friction); 
+
+                // Damped velocity update
+                velocities[i] = damping * velocities[i] + alpha * forces[i];
+
+                // FIRE check: reset velocity if it opposes the force
+                if velocities[i].dot(forces[i]) < 0.0 {
+                    velocities[i] = DVec2::ZERO;
+                }
+
+                self.particles[idx].pos = old_positions[i] + velocities[i];
+                converged = converged
+                    && (forces[i].length_squared() < static_friction * static_friction)
+                    && (velocities[i].length_squared() < 1e-12);
             }
 
             // Aggregate reaction forces on each touched neighbor, activate if
@@ -671,9 +687,12 @@ impl Simulation {
                         let old_pos = self.particles[nb_idx].pos;
                         initial_positions.push(old_pos);
                         let adjusted = nb_force * ((f_mag - static_friction) / f_mag);
-                        self.particles[nb_idx].pos += alpha * adjusted;
+                        let vel = alpha * adjusted;
+                        self.particles[nb_idx].pos += vel;
                         self.in_active[nb_idx] = true;
                         active.push(nb_idx);
+                        // Initialize velocity for newly activated particle
+                        velocities[active.len() - 1] = vel;
                         moved.push((nb_idx, old_pos));
                         converged = false; 
                     }
@@ -692,11 +711,23 @@ impl Simulation {
         }
 
         // ── Post-relaxation: refresh rates and candidate sites ────────────
-        // Collect every particle whose bonds may have changed (sorted + dedup, no HashSet)
+        // Collect every particle whose bonds may have changed, using query_buf
+        // to avoid per-call Vec allocation from get_neighbors.
+        let delta = self.config.delta;
+        let max_radius = self.config.max_radius();
         let mut rate_indices: Vec<usize> = Vec::new();
         for &idx in &active {
             rate_indices.push(idx);
-            rate_indices.extend(self.get_neighbors(idx));
+            let p = &self.particles[idx];
+            let cutoff = p.radius + max_radius + delta;
+            let nearby = self.spatial.query(p.pos.x, p.pos.y, cutoff);
+            for ni in nearby {
+                if ni != idx && ni < self.particles.len()
+                    && p.bonds_to(&self.particles[ni], delta)
+                {
+                    rate_indices.push(ni);
+                }
+            }
         }
         rate_indices.sort_unstable();
         rate_indices.dedup();
