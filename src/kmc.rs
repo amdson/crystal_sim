@@ -9,7 +9,30 @@ use crate::rates::RateCatalog;
 use crate::rng::Rng;
 use crate::spatial::{ParticleGrid, SpatialHash};
 
-use std::time::{Duration, Instant};
+/// Read the CPU timestamp counter — ~4 cycles, no syscall.
+#[inline(always)]
+fn rdtsc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: RDTSC is universally supported on x86_64.
+    unsafe { core::arch::x86_64::_rdtsc() }
+    #[cfg(not(target_arch = "x86_64"))]
+    { 0 }
+}
+
+/// Measure TSC frequency by comparing against a wall-clock sleep.
+fn calibrate_tsc_ghz() -> f64 {
+    #[cfg(target_arch = "x86_64")] {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        let c0 = rdtsc();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let elapsed_ns = t0.elapsed().as_nanos() as f64;
+        let dc = rdtsc().wrapping_sub(c0) as f64;
+        dc / elapsed_ns
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    { 1.0 }
+}
 
 #[repr(usize)]
 enum TimerEntry {
@@ -17,10 +40,14 @@ enum TimerEntry {
     Attach,
     Detach,
     Rebuild,
+    Relax,
+    RegenCandidates,
     Count,
 }
 
-static ENUM_STR: [&str; TimerEntry::Count as usize] = ["Select", "Attach", "Detach", "Rebuild"];
+static ENUM_STR: [&str; TimerEntry::Count as usize] = [
+    "Select", "Attach", "Detach", "Rebuild", "Relax", "RegenCandidates",
+];
 
 pub struct Simulation {
     /// Particles stored directly in the spatial grid; indexed by slot.
@@ -39,8 +66,10 @@ pub struct Simulation {
     pub rng: Rng,
     /// Flat f32 particle buffer: [x, y, type_id_f32, radius, ...] stride 4
     pub particle_buf: Vec<f32>,
-    pub timers: Vec<Duration>,
-    pub usages: Vec<u32>,
+    /// Accumulated TSC cycles per timer bucket.
+    pub timers: Vec<u64>,
+    pub usages: Vec<u64>,
+    cpu_ghz: f64,
     /// Reusable boolean mask for active-set relaxation (avoids per-call allocation).
     in_active: Vec<bool>,
     /// Reusable buffer for spatial hash queries (avoids per-query allocation).
@@ -50,7 +79,7 @@ pub struct Simulation {
 /*
 Simulation steps
 - Select candidate (add particle t at x, y or / remove particle i)
-- If add:
+- If attach:
     - Add particle
     - Run relaxation (Nx steps of gradient descent in neighborhood)
     - Replace influenced candidates
@@ -62,7 +91,7 @@ Simulation steps
 impl Simulation {
     pub fn new(mut config: SimConfig) -> Self {
         config.init_cache();
-        let cell_size = config.max_cutoff().max(0.1);
+        let cell_size = config.max_cutoff().max(0.1) * 2.0; //Large cell size
 
         let mut sim = Self {
             particles: ParticleGrid::new(cell_size),
@@ -75,8 +104,9 @@ impl Simulation {
             rng: Rng::new(config.seed),
             particle_buf: Vec::new(),
             config,
-            timers: (0..TimerEntry::Count as usize).map(|_| Duration::new(0, 0)).collect(),
-            usages: vec![0; TimerEntry::Count as usize],
+            timers: vec![0u64; TimerEntry::Count as usize],
+            usages: vec![0u64; TimerEntry::Count as usize],
+            cpu_ghz: calibrate_tsc_ghz(),
             in_active: Vec::new(),
             query_buf: Vec::new(),
         };
@@ -95,7 +125,7 @@ impl Simulation {
 
     pub fn step(&mut self, n: u32) {
         for _ in 0..n {
-            let now_sel = Instant::now();
+            let t0_sel = rdtsc();
             let attach_total = self.attach_rates.total();
             let detach_total = self.detach_rates.total();
             let r_total = attach_total + detach_total;
@@ -111,39 +141,43 @@ impl Simulation {
             if u1 < attach_total / r_total {
                 let attach_u = u1 * r_total / attach_total;
                 let candidate_ind = self.attach_rates.select(attach_u);
-                self.timers[TimerEntry::Select as usize] += now_sel.elapsed();
+                self.timers[TimerEntry::Select as usize] += rdtsc().wrapping_sub(t0_sel);
                 self.usages[TimerEntry::Select as usize] += 1;
 
-                let now = Instant::now();
+                let t0 = rdtsc();
                 let site = self.candidates[candidate_ind].clone();
                 self.attach(site);
-                self.timers[TimerEntry::Attach as usize] += now.elapsed();
+                self.timers[TimerEntry::Attach as usize] += rdtsc().wrapping_sub(t0);
                 self.usages[TimerEntry::Attach as usize] += 1;
             } else {
                 let detach_u = (u1 - attach_total / r_total) * r_total / detach_total;
                 let slot = self.detach_rates.select(detach_u);
-                self.timers[TimerEntry::Select as usize] += now_sel.elapsed();
+                self.timers[TimerEntry::Select as usize] += rdtsc().wrapping_sub(t0_sel);
                 self.usages[TimerEntry::Select as usize] += 1;
 
-                let now = Instant::now();
+                let t0 = rdtsc();
                 self.detach(slot);
-                self.timers[TimerEntry::Detach as usize] += now.elapsed();
+                self.timers[TimerEntry::Detach as usize] += rdtsc().wrapping_sub(t0);
                 self.usages[TimerEntry::Detach as usize] += 1;
             }
         }
 
-        let now = Instant::now();
+        let t0 = rdtsc();
         self.rebuild_particle_buf();
-        self.timers[TimerEntry::Rebuild as usize] += now.elapsed();
+        self.timers[TimerEntry::Rebuild as usize] += rdtsc().wrapping_sub(t0);
         self.usages[TimerEntry::Rebuild as usize] += 1;
+
+        let ghz = self.cpu_ghz;
         for i in 0..(TimerEntry::Count as usize) {
-            let time = self.timers[i];
+            let cycles = self.timers[i];
+            let calls = self.usages[i];
             let label = ENUM_STR[i];
-            if self.usages[i] > 0 {
-                let avg_time = self.timers[i] / self.usages[i];
-                println!("{label} avg time: {avg_time:?} total time: {time:?}");
+            let total_ms = cycles as f64 / ghz / 1e6;
+            if calls > 0 {
+                let avg_ns = cycles as f64 / ghz / calls as f64;
+                println!("{label:18} calls={calls:6}  avg={avg_ns:8.0}ns  total={total_ms:.3}ms");
             } else {
-                println!("{label} avg time: N/A total time: {time:?}");
+                println!("{label:18} calls=     0  avg=       -    total=  0.000ms");
             }
         }
     }
@@ -192,7 +226,10 @@ impl Simulation {
         let new_idx = self.particles.len() - 1;
 
         if self.config.relax_steps > 0 {
+            let t0 = rdtsc();
             self.relax_new_particle(new_idx);
+            self.timers[TimerEntry::Relax as usize] += rdtsc().wrapping_sub(t0);
+            self.usages[TimerEntry::Relax as usize] += 1;
         } else {
             self.update_detach_rate(new_idx);
             let nbs = self.get_neighbors(new_idx);
@@ -200,7 +237,10 @@ impl Simulation {
                 self.update_detach_rate(nb);
             }
             let regen_r = (self.config.max_cutoff() + rc) * 2.0;
+            let t0 = rdtsc();
             self.regen_candidates_near(pos, regen_r);
+            self.timers[TimerEntry::RegenCandidates as usize] += rdtsc().wrapping_sub(t0);
+            self.usages[TimerEntry::RegenCandidates as usize] += 1;
         }
     }
 
@@ -230,7 +270,10 @@ impl Simulation {
         }
 
         let regen_r = self.config.max_cutoff() * 2.0;
+        let t0 = rdtsc();
         self.regen_candidates_near(pos, regen_r);
+        self.timers[TimerEntry::RegenCandidates as usize] += rdtsc().wrapping_sub(t0);
+        self.usages[TimerEntry::RegenCandidates as usize] += 1;
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
