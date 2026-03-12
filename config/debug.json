@@ -12,7 +12,7 @@
     "relax_steps": 120,
     "relax_alpha": 2e-2, 
     "spring_k": 10.0, 
-    "steps_per_frame": 20, 
+    "steps_per_frame": 120, 
     "static_friction": 0.2, 
     "lj_cutoff_factor": 2.3
 }

@@ -63,7 +63,9 @@ impl CrystalSim {
 
     /// Update temperature at runtime.
     pub fn set_temperature(&mut self, t: f64) {
-        self.inner.set_temperature(t);
+        // self.inner.set_temperature(t);
+        //pass
+        return;
     }
 
     // /// Update chemical potential for a particle type at runtime.

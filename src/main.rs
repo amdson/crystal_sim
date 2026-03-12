@@ -86,16 +86,18 @@ impl CrystalApp {
     }
 
     fn auto_center(&mut self) {
-        if self.sim.particles.is_empty() {
+        if self.sim.particle_count() == 0 {
             return;
         }
         let mut cx = 0.0f64;
         let mut cy = 0.0f64;
-        for p in &self.sim.particles {
+        let mut n = 0;
+        for p in self.sim.particle_grid.iter() {
             cx += p.pos.x;
             cy += p.pos.y;
+            n += 1;
         }
-        let n = self.sim.particles.len() as f64;
+        let n = n as f64;
         self.pan = Vec2::new(-(cx / n) as f32, -(cy / n) as f32);
     }
 }
@@ -141,13 +143,13 @@ impl eframe::App for CrystalApp {
 
             ui.separator();
 
-            ui.label("Temperature");
-            if ui
-                .add(egui::Slider::new(&mut self.temperature, 0.1..=5.0).step_by(0.05))
-                .changed()
-            {
-                self.sim.set_temperature(self.temperature);
-            }
+            // ui.label("Temperature");
+            // if ui
+            //     .add(egui::Slider::new(&mut self.temperature, 0.1..=5.0).step_by(0.05))
+            //     .changed()
+            // {
+            //     self.sim.set_temperature(self.temperature);
+            // }
 
             ui.separator();
 
@@ -206,33 +208,33 @@ impl eframe::App for CrystalApp {
             painter.rect_filled(rect, 0.0, Color32::from_rgb(12, 12, 22));
 
             // Bonds
-            if self.show_bonds {
-                for i in 0..self.sim.particles.len() {
-                    let nbrs = self.sim.get_neighbors(i);
-                    for j in nbrs {
-                        if j <= i {
-                            continue; // draw each bond once
-                        }
-                        let a = self.sim_to_screen(
-                            self.sim.particles[i].pos.x,
-                            self.sim.particles[i].pos.y,
-                            rect,
-                        );
-                        let b = self.sim_to_screen(
-                            self.sim.particles[j].pos.x,
-                            self.sim.particles[j].pos.y,
-                            rect,
-                        );
-                        painter.line_segment(
-                            [a, b],
-                            Stroke::new(1.2, Color32::from_rgba_unmultiplied(200, 200, 220, 70)),
-                        );
-                    }
-                }
-            }
+            // if self.show_bonds {
+            //     for i in 0..self.sim.particles.len() {
+            //         let nbrs = self.sim.get_neighbors(i);
+            //         for j in nbrs {
+            //             if j <= i {
+            //                 continue; // draw each bond once
+            //             }
+            //             let a = self.sim_to_screen(
+            //                 self.sim.particles[i].pos.x,
+            //                 self.sim.particles[i].pos.y,
+            //                 rect,
+            //             );
+            //             let b = self.sim_to_screen(
+            //                 self.sim.particles[j].pos.x,
+            //                 self.sim.particles[j].pos.y,
+            //                 rect,
+            //             );
+            //             painter.line_segment(
+            //                 [a, b],
+            //                 Stroke::new(1.2, Color32::from_rgba_unmultiplied(200, 200, 220, 70)),
+            //             );
+            //         }
+            //     }
+            // }
 
             // Particles
-            for particle in &self.sim.particles {
+            for particle in self.sim.particle_grid.iter() {
                 let pos = self.sim_to_screen(particle.pos.x, particle.pos.y, rect);
                 // Skip particles outside the visible rect with a margin
                 if pos.x < rect.left() - 50.0
