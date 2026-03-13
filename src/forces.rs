@@ -46,8 +46,15 @@ pub fn lj_force_vec(r_vec: DVec2, r_contact: f64, epsilon: f64, r_cut: f64) -> D
     let sr12 = sr6 * sr6;
     // Factor: 24ε/r² · [2(σ/r)^12 − (σ/r)^6]
     // Positive → along r_vec (repulsive), negative → against r_vec (attractive)
-    let coeff = 24.0 * epsilon / r2 * (2.0 * sr12 - sr6);
-    coeff * r_vec
+    if epsilon > 0.0 {
+            let epsilon = 1.0; // override epsilon to 1.0 for positively interacting pairs
+            let coeff = 24.0 * epsilon / r2 * (2.0 * sr12 - sr6);
+        coeff * r_vec
+    } else {
+        let epsilon = 1.0; 
+        let coeff = 24.0 * epsilon / r2 * (2.0 * sr12); // only keep the repulsive r^(-12) term for negatively interacting pairs
+        coeff * r_vec
+    }
 }
 
 // ── Harmonic spring ───────────────────────────────────────────────────────────

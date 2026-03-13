@@ -8,7 +8,8 @@ use crate::config::SimConfig;
 use crate::particle::Particle;
 use crate::rates::RateCatalog;
 use crate::rng::Rng;
-use crate::spatial::{accumulate_lj_forces, step_velocities_and_activate, ParticleGrid, SpatialHash};
+use crate::forces::lj_force_vec;
+use crate::spatial::{accumulate_lj_forces, step_velocities_and_activate, Cell, ParticleGrid, SpatialHash};
 
 /// Read the CPU timestamp counter — ~4 cycles, no syscall.
 #[inline(always)]
@@ -69,7 +70,7 @@ pub struct Simulation {
     pub timers: Vec<u64>,
     pub usages: Vec<u64>,
     cpu_ghz: f64,
-
+    
     /// Reusable buffer for spatial hash queries (avoids per-query allocation).
     query_buf: Vec<usize>,
     particle_buf: Vec<f32>, // Flat buffer of (x, y, type_id, radius) for WASM export.
@@ -90,7 +91,7 @@ Simulation steps
 impl Simulation {
     pub fn new(mut config: SimConfig) -> Self {
         config.init_cache();
-        let cell_size = config.max_cutoff().max(0.1) * 2.0; //Large cell size
+        let cell_size = config.max_cutoff().max(0.1)*1.1; //Large cell size
 
         let mut sim = Self {
             particle_grid: ParticleGrid::new(cell_size),
@@ -170,8 +171,8 @@ impl Simulation {
             let label = ENUM_STR[i];
             let total_ms = cycles as f64 / ghz / 1e6;
             if calls > 0 {
-                let avg_ns = cycles as f64 / ghz / calls as f64;
-                println!("{label:18} calls={calls:6}  avg={avg_ns:8.0}ns  total={total_ms:.3}ms");
+                let avg_ms = cycles as f64 / ghz / 1e6 / calls as f64;
+                println!("{label:18} calls={calls:6}  avg={avg_ms:8.3}ms  total={total_ms:.3}ms");
             } else {
                 println!("{label:18} calls=     0  avg=       -    total=  0.000ms");
             }
@@ -210,10 +211,18 @@ impl Simulation {
         let pos = site.pos;
 
         let query_r = rc + self.config.max_radius() + 1e-6;
-        let nearby = self.particle_grid.query(pos.x, pos.y, query_r);
-        let positions: Vec<DVec2> = nearby.iter().map(|p| p.pos).collect();
-        let radii: Vec<f64> = nearby.iter().map(|p| p.radius).collect();
-        if site_has_overlap(pos, rc, self.config.delta, &(0..nearby.len()).collect::<Vec<_>>(), &positions, &radii) {
+        let delta = self.config.delta;
+        let mut has_overlap = false;
+        self.particle_grid.query_iter(pos.x, pos.y, query_r, |p| {
+            if has_overlap {
+                return;
+            }
+            let overlap_dist = rc + p.radius - delta;
+            if overlap_dist > 0.0 && pos.distance_squared(p.pos) < overlap_dist * overlap_dist {
+                has_overlap = true;
+            }
+        });
+        if has_overlap {
             return;
         }
 
@@ -222,7 +231,7 @@ impl Simulation {
 
         if self.config.relax_steps > 0 {
             let t0 = rdtsc();
-            self.relax_new_particle(new_p.clone());
+            self.relax_new_particle_fixed_grid(new_p.clone());
             self.timers[TimerEntry::Relax as usize] += rdtsc().wrapping_sub(t0);
             self.usages[TimerEntry::Relax as usize] += 1;
         } else {
@@ -248,7 +257,7 @@ impl Simulation {
         };
 
         // Snapshot the particle and its neighbours before removal.
-        let detach_p = self.particle_grid.cells[&cell][ind].clone();
+        let detach_p = self.particle_grid.cells[cell].particles[ind].clone();
         let nbs = self.get_neighbors(&detach_p);
         let pos = detach_p.pos;
 
@@ -500,8 +509,146 @@ impl Simulation {
 
     // ── Post-attachment relaxation ────────────────────────────────────────────
 
-    /// Steepest-descent relaxation of the neighbourhood of a newly attached particle.
-    fn relax_new_particle(&mut self, new_p: Particle) {
+    // /// Steepest-descent relaxation of the neighbourhood of a newly attached particle.
+    // fn relax_new_particle(&mut self, new_p: Particle) {
+    //     if self.config.relax_steps == 0 { return; }
+
+    //     let alpha            = self.config.relax_alpha;
+    //     let damping          = self.config.relax_damping;
+    //     let static_friction  = self.static_friction;
+    //     let lj_cutoff_factor = self.config.lj_cutoff_factor;
+    //     let max_radius       = self.config.max_radius();
+    //     let max_active_cells: usize = 32;
+
+    //     // The new particle is the last entry in its cell (inserted by add_particle_raw).
+    //     let new_cell = self.particle_grid.cell_key(new_p.pos.x, new_p.pos.y);
+    //     let new_ind  = self.particle_grid.cells[new_cell].particles.len() - 1;
+
+    //     // Compute the cell-neighborhood radius for LJ interactions.
+    //     let query_r = max_radius * lj_cutoff_factor * 2.0 + 1e-6;
+    //     let cell_r  = (query_r / self.particle_grid.cell_size).ceil() as i64;
+
+    //     // Helper: expand a cell set by `cell_r` in each direction.
+    //     let expand_cells = |src: &HashSet<(i64, i64)>| -> HashSet<(i64, i64)> {
+    //         let mut out = HashSet::new();
+    //         for &(cx, cy) in src {
+    //             for dx in -cell_r..=cell_r {
+    //                 for dy in -cell_r..=cell_r {
+    //                     out.insert((cx + dx, cy + dy));
+    //                 }
+    //             }
+    //         }
+    //         out
+    //     };
+
+    //     let mut active_cells: HashSet<(i64, i64)> = std::iter::once(new_cell).collect();
+    //     let initial_cells = active_cells.clone();
+    //     let mut initialized_cells = expand_cells(&active_cells);
+    //     initialized_cells.extend(active_cells.iter());
+
+    //     self.particle_grid.init_physics_for_cells(initialized_cells.iter().copied());
+    //     self.particle_grid.mark_active(new_cell, new_ind, DVec2::ZERO);
+
+    //     for _ in 0..self.config.relax_steps {
+    //         // Zero forces for all initialized cells.
+    //         for &cell in &initialized_cells {
+    //             if let Some(fs) = self.particle_grid.cell_forces.get_mut(&cell) {
+    //                 for f in fs.iter_mut() { *f = DVec2::ZERO; }
+    //             }
+    //         }
+
+    //         // Accumulate LJ forces (split borrow: &cells / &mut cell_forces).
+    //         {
+    //             let cells       = &self.particle_grid.cells;
+    //             let cell_forces = &mut self.particle_grid.cell_forces;
+    //             accumulate_lj_forces(
+    //                 cells, cell_forces,
+    //                 &active_cells, self.particle_grid.cell_size, max_radius, lj_cutoff_factor,
+    //             );
+    //         }
+
+    //         // Velocity step + activation check (split borrow: &mut cells / &cell_forces).
+    //         let neighbor_only: HashSet<(i64, i64)> =
+    //             initialized_cells.difference(&active_cells).copied().collect();
+    //         let (converged, new_cells) = {
+    //             let cells       = &mut self.particle_grid.cells;
+    //             let cell_forces = &self.particle_grid.cell_forces;
+    //             step_velocities_and_activate(
+    //                 cells, cell_forces,
+    //                 &active_cells, &neighbor_only,
+    //                 alpha, damping, static_friction, max_active_cells,
+    //             )
+    //         };
+
+    //         // Expand active + initialized sets if new cells were activated.
+    //         if !new_cells.is_empty() {
+    //             let new_neighbors: HashSet<(i64, i64)> = expand_cells(&new_cells)
+    //                 .into_iter()
+    //                 .filter(|c| !initialized_cells.contains(c))
+    //                 .collect();
+    //             if !new_neighbors.is_empty() {
+    //                 self.particle_grid.init_physics_for_cells(new_neighbors.iter().copied());
+    //                 initialized_cells.extend(new_neighbors);
+    //             }
+    //             active_cells.extend(new_cells);
+    //         }
+
+    //         // Commit positions; incorporate any cells particles moved into.
+    //         let moved_to = self.particle_grid.commit_positions(&active_cells);
+    //         for cell in &moved_to {
+    //             if !initialized_cells.contains(cell) {
+    //                 self.particle_grid.init_physics_for_cells(std::iter::once(*cell));
+    //                 initialized_cells.insert(*cell);
+    //             }
+    //         }
+    //         active_cells.extend(moved_to);
+
+    //         if converged { break; }
+    //     }
+
+    //     // ── Post-relaxation: update rates for moved particles and their bonds ──
+    //     let delta = self.config.delta;
+    //     let mut rate_particles: Vec<Particle> = Vec::new();
+    //     for &cell in &active_cells {
+    //         if let Some(c) = self.particle_grid.cells.get(&cell) {
+    //             rate_particles.extend_from_slice(&c.particles);
+    //         }
+    //     }
+    //     // Include bonded neighbours of active particles.
+    //     let mut bonded: Vec<Particle> = Vec::new();
+    //     for p in &rate_particles {
+    //         self.particle_grid.query_iter(p.pos.x, p.pos.y, p.radius + max_radius + delta, |nb| {
+    //             if nb.pos != p.pos && p.bonds_to(nb, delta) { bonded.push(nb.clone()); }
+    //         });
+    //     }
+    //     rate_particles.extend(bonded);
+    //     rate_particles.sort_unstable_by(|a, b| a.pos.x.total_cmp(&b.pos.x).then(a.pos.y.total_cmp(&b.pos.y)));
+    //     rate_particles.dedup_by(|a, b| a.pos == b.pos);
+    //     for p in &rate_particles { self.update_detach_rate(p); }
+
+    //     // Regen candidates for current and initial cell positions.
+    //     let regen_r = self.config.max_cutoff() * 2.0;
+    //     let mut regen_regions: Vec<(DVec2, f64)> = Vec::new();
+    //     for &cell in active_cells.iter().chain(initial_cells.iter()) {
+    //         if let Some(c) = self.particle_grid.cells.get(&cell) {
+    //             for p in &c.particles { regen_regions.push((p.pos, regen_r)); }
+    //         }
+    //     }
+    //     self.regen_candidates_batch(&regen_regions);
+
+    //     self.particle_grid.clear_physics_for_cells(&initialized_cells);
+    // }
+
+
+    /// Fixed-grid relaxation variant.
+    ///
+    /// Instead of dynamically growing an active set, this activates **all** particles
+    /// in a 5×5 cell neighbourhood around the new particle immediately, backed by a
+    /// `(5 + 2*cell_r)²` initialised border.  Raw `Cell` pointers are cached before
+    /// the loop so the hot inner loops use array indexing instead of HashMap lookups.
+    ///
+    /// Swap for `relax_new_particle` at the call site in `attach` to compare.
+    fn relax_new_particle_fixed_grid(&mut self, new_p: Particle) {
         if self.config.relax_steps == 0 { return; }
 
         let alpha            = self.config.relax_alpha;
@@ -509,110 +656,179 @@ impl Simulation {
         let static_friction  = self.static_friction;
         let lj_cutoff_factor = self.config.lj_cutoff_factor;
         let max_radius       = self.config.max_radius();
-        let max_active_cells: usize = 32;
+        let cell_size        = self.particle_grid.cell_size;
 
-        // The new particle is the last entry in its cell (inserted by add_particle_raw).
-        let new_cell = self.particle_grid.cell_key(new_p.pos.x, new_p.pos.y);
-        let new_ind  = self.particle_grid.cells[&new_cell].len() - 1;
+        let center    = self.particle_grid.cell_key(new_p.pos.x, new_p.pos.y);
+        let query_r   = max_radius * lj_cutoff_factor * 2.0 + 1e-6;
+        let cell_r    = (query_r / cell_size).ceil() as i64;
+        let act_half  = 5i64;              // 5×5 active zone
+        let init_half = act_half + cell_r; // margin so every active particle sees full LJ range
+        let w         = (2 * init_half + 1) as usize;
+        let n         = w * w;
 
-        // Compute the cell-neighborhood radius for LJ interactions.
-        let query_r = max_radius * lj_cutoff_factor * 2.0 + 1e-6;
-        let cell_r  = (query_r / self.particle_grid.cell_size).ceil() as i64;
-
-        // Helper: expand a cell set by `cell_r` in each direction.
-        let expand_cells = |src: &HashSet<(i64, i64)>| -> HashSet<(i64, i64)> {
-            let mut out = HashSet::new();
-            for &(cx, cy) in src {
-                for dx in -cell_r..=cell_r {
-                    for dy in -cell_r..=cell_r {
-                        out.insert((cx + dx, cy + dy));
-                    }
+        // ── Build flat key array (row-major, origin = top-left corner) ────────
+        let keys: Vec<(i64, i64)> = {
+            let mut v = vec![(0i64, 0i64); n];
+            for gy in -init_half..=init_half {
+                for gx in -init_half..=init_half {
+                    v[((gy + init_half) as usize) * w + (gx + init_half) as usize] =
+                        (center.0 + gx, center.1 + gy);
                 }
             }
-            out
+            v
         };
 
-        let mut active_cells: HashSet<(i64, i64)> = std::iter::once(new_cell).collect();
-        let initial_cells = active_cells.clone();
-        let mut initialized_cells = expand_cells(&active_cells);
-        initialized_cells.extend(active_cells.iter());
+        let cell_ind: Vec<Option<usize>> = keys.iter().map(|k| {
+            self.particle_grid.cell_map.get(k).copied()
+        }).collect();
 
-        self.particle_grid.init_physics_for_cells(initialized_cells.iter().copied());
-        self.particle_grid.mark_active(new_cell, new_ind, DVec2::ZERO);
+        let slot_is_active = |s: usize| -> bool {
+            let gx = (s % w) as i64 - init_half;
+            let gy = (s / w) as i64 - init_half;
+            gx.abs() <= act_half && gy.abs() <= act_half
+        };
 
+        // ── Init physics; mark every particle in the 5×5 zone active ─────────
+        let active_slots: Vec<usize> = (0..n).filter(|&s| slot_is_active(s)).collect();
+        self.particle_grid.init_physics_for_cells(keys.iter().copied());
+        for &s in &active_slots {
+            if let Some(cell_idx) = cell_ind[s] {
+                let cell = &mut self.particle_grid.cells[cell_idx];
+                cell.is_active.iter_mut().for_each(|a| *a = true);
+            }
+        }
+
+        let active_cells: HashSet<(i64, i64)> =
+            active_slots.iter().map(|&s| keys[s]).collect();
+        let active_cell_indices: Vec<usize> =
+            active_slots.iter().filter_map(|&s| cell_ind[s]).collect();
+        let initialized_cell_indices: Vec<usize> =
+            cell_ind.iter().filter_map(|&idx| idx).collect();
+
+        // let t0 = rdtsc();
+        // ── Relaxation loop ───────────────────────────────────────────────────
         for _ in 0..self.config.relax_steps {
-            // Zero forces for all initialized cells.
-            for &cell in &initialized_cells {
-                if let Some(fs) = self.particle_grid.cell_forces.get_mut(&cell) {
+            // Zero forces.
+            for &idx in &initialized_cell_indices {
+                if let Some(fs) = self.particle_grid.cell_forces.get_mut(idx) {
                     for f in fs.iter_mut() { *f = DVec2::ZERO; }
                 }
             }
 
-            // Accumulate LJ forces (split borrow: &cells / &mut cell_forces).
-            {
-                let cells          = &self.particle_grid.cells;
-                let cell_forces    = &mut self.particle_grid.cell_forces;
-                let cell_is_active = &self.particle_grid.cell_is_active;
-                let cell_is_frozen = &self.particle_grid.cell_is_frozen;
-                accumulate_lj_forces(
-                    cells, cell_forces, cell_is_active, cell_is_frozen,
-                    &active_cells, self.particle_grid.cell_size, max_radius, lj_cutoff_factor,
-                );
-            }
+            // Accumulate LJ forces via cached cell indices. 
+            for &ai_slot in &active_slots {
+                let a_ind = cell_ind[ai_slot];
+                if a_ind.is_none() { continue; }
+                let a_ind = a_ind.unwrap();
+                let a_cell = &self.particle_grid.cells[a_ind];
+                let a_gx = (ai_slot % w) as i64;
+                let a_gy = (ai_slot / w) as i64;
 
-            // Velocity step + activation check (split borrow).
-            let neighbor_only: HashSet<(i64, i64)> =
-                initialized_cells.difference(&active_cells).copied().collect();
-            let (converged, new_cells) = {
-                let cells           = &self.particle_grid.cells;
-                let cell_forces     = &self.particle_grid.cell_forces;
-                let cell_velocities = &mut self.particle_grid.cell_velocities;
-                let cell_new_pos    = &mut self.particle_grid.cell_new_pos;
-                let cell_is_active  = &mut self.particle_grid.cell_is_active;
-                let cell_is_frozen  = &self.particle_grid.cell_is_frozen;
-                step_velocities_and_activate(
-                    cells, cell_forces, cell_velocities, cell_new_pos,
-                    cell_is_active, cell_is_frozen,
-                    &active_cells, &neighbor_only,
-                    alpha, damping, static_friction, max_active_cells,
-                )
-            };
+                for ai in 0..a_cell.particles.len() {
+                    if !a_cell.is_active[ai] { continue; }
+                    let a_pos = a_cell.particles[ai].pos;
+                    let a_r   = a_cell.particles[ai].radius;
 
-            // Expand active + initialized sets if new cells were activated.
-            if !new_cells.is_empty() {
-                let new_neighbors: HashSet<(i64, i64)> = expand_cells(&new_cells)
-                    .into_iter()
-                    .filter(|c| !initialized_cells.contains(c))
-                    .collect();
-                if !new_neighbors.is_empty() {
-                    self.particle_grid.init_physics_for_cells(new_neighbors.iter().copied());
-                    initialized_cells.extend(new_neighbors);
+                    for dx in -cell_r..=cell_r {
+                        let nb_gx = a_gx + dx;
+                        if nb_gx < 0 || nb_gx >= w as i64 { continue; }
+                        for dy in -cell_r..=cell_r {
+                            let nb_gy = a_gy + dy;
+                            if nb_gy < 0 || nb_gy >= w as i64 { continue; }
+                            let nb_slot = nb_gy as usize * w + nb_gx as usize;
+
+                            let b_ind = cell_ind[nb_slot];
+                            if b_ind.is_none() { continue; }
+                            let b_ind = b_ind.unwrap();
+                            let b_cell = &self.particle_grid.cells[b_ind];
+
+                            for bi in 0..b_cell.particles.len() {
+                                if nb_slot == ai_slot && bi == ai { continue; }
+                                let b_is_active = b_cell.is_active[bi];
+                                if b_is_active && (nb_slot < ai_slot || (nb_slot == ai_slot && bi < ai)) {
+                                    continue;
+                                }
+                                let b_pos = b_cell.particles[bi].pos;
+                                let b_r   = b_cell.particles[bi].radius;
+                                let r_contact = a_r + b_r;
+                                let epsilon = self.config.epsilon(a_cell.particles[ai].type_id, b_cell.particles[bi].type_id);
+                                let f = -lj_force_vec(b_pos - a_pos, r_contact, epsilon,
+                                                        r_contact * lj_cutoff_factor);
+                                if f == DVec2::ZERO { continue; }
+
+                                let af = &mut self.particle_grid.cell_forces[a_ind];
+                                if ai < af.len() { af[ai] += f; }
+
+                                // Equal-and-opposite reaction is needed for active neighbors
+                                // (we skip mirrored active-active pairs), and for movable
+                                // inactive neighbors used in activation checks.
+                                if b_is_active || !b_cell.is_frozen[bi] {
+                                    let bf = &mut self.particle_grid.cell_forces[b_ind];
+                                    if bi < bf.len() { bf[bi] -= f; }
+                                }
+                            }
+                        }
+                    }
                 }
-                active_cells.extend(new_cells);
             }
 
-            // Commit positions; incorporate any cells particles moved into.
-            let moved_to = self.particle_grid.commit_positions(&active_cells);
-            for cell in &moved_to {
-                if !initialized_cells.contains(cell) {
-                    self.particle_grid.init_physics_for_cells(std::iter::once(*cell));
-                    initialized_cells.insert(*cell);
+            // Velocity step.
+            let mut converged = true;
+            for &cp in &active_cell_indices {
+                let cell = &mut self.particle_grid.cells[cp];
+                let fp = &mut self.particle_grid.cell_forces[cp];
+
+                for ind in 0..cell.particles.len() {
+                    if !cell.is_active[ind] { continue; }
+                    let f_raw     = if fp.is_empty() { DVec2::ZERO } else { fp[ind] };
+                    let f_clamped = f_raw.clamp_length_max(3.0);
+                    let f_mag     = f_clamped.length();
+                    let f_eff     = if f_mag > static_friction {
+                        f_clamped * ((f_mag - static_friction) / f_mag)
+                    } else { DVec2::ZERO };
+
+                    let v_raw = damping * cell.velocities[ind] + alpha * f_eff;
+                    let v_new = if v_raw.dot(f_eff) >= 0.0 { v_raw } else { DVec2::ZERO };
+
+                    cell.new_pos[ind]    = cell.particles[ind].pos + v_new;
+                    cell.velocities[ind] = v_new;
+
+                    // if f_eff.length_squared() >= static_friction * static_friction
+                    //     || v_new.length_squared() >= 1e-12
+                    // {
+                    //     converged = false;
+                    // }
+                    if f_eff.length_squared() >= 0.05 * 0.05
+                    {
+                        converged = false;
+                    }
                 }
             }
-            active_cells.extend(moved_to);
 
+            // Commit positions; refresh pointer cache if any cross-cell moves occurred.
+            // Cell struct addresses in the HashMap are stable after swap_remove/push
+            // (those only mutate the Cell's internal Vecs), but a move outside the
+            // preloaded grid would insert a new key and potentially rehash.
+            let moved = self.particle_grid.commit_positions(&active_cells);
             if converged { break; }
         }
 
-        // ── Post-relaxation: update rates for moved particles and their bonds ──
-        let delta = self.config.delta;
+        // self.timers[TimerEntry::Attach as usize] += rdtsc().wrapping_sub(t0);
+        // self.usages[TimerEntry::Attach as usize] += 1;
+        // ── Post-relaxation: update rates and regen candidates ────────────────
+        let delta   = self.config.delta;
+        let regen_r = self.config.max_cutoff() * 2.0;
         let mut rate_particles: Vec<Particle> = Vec::new();
-        for &cell in &active_cells {
-            if let Some(ps) = self.particle_grid.cells.get(&cell) {
-                rate_particles.extend(ps.iter().cloned());
+        let mut regen_regions:  Vec<(DVec2, f64)> = Vec::new();
+        for &s in &active_slots {
+            if let Some(cell_idx) = cell_ind[s] {
+                 let cell = &self.particle_grid.cells[cell_idx];
+                    rate_particles.extend_from_slice(&cell.particles);
+                    for p in &cell.particles { regen_regions.push((p.pos, regen_r)); }
             }
         }
-        // Include bonded neighbours of active particles.
+
+        // Include bonded neighbours outside the active zone. 
         let mut bonded: Vec<Particle> = Vec::new();
         for p in &rate_particles {
             self.particle_grid.query_iter(p.pos.x, p.pos.y, p.radius + max_radius + delta, |nb| {
@@ -620,23 +836,17 @@ impl Simulation {
             });
         }
         rate_particles.extend(bonded);
-        rate_particles.sort_unstable_by(|a, b| a.pos.x.total_cmp(&b.pos.x).then(a.pos.y.total_cmp(&b.pos.y)));
+        rate_particles.sort_unstable_by(|a, b| {
+            a.pos.x.total_cmp(&b.pos.x).then(a.pos.y.total_cmp(&b.pos.y))
+        });
         rate_particles.dedup_by(|a, b| a.pos == b.pos);
         for p in &rate_particles { self.update_detach_rate(p); }
 
-        // Regen candidates for current and initial cell positions.
-        let regen_r = self.config.max_cutoff() * 2.0;
-        let mut regen_regions: Vec<(DVec2, f64)> = Vec::new();
-        for &cell in active_cells.iter().chain(initial_cells.iter()) {
-            if let Some(ps) = self.particle_grid.cells.get(&cell) {
-                for p in ps { regen_regions.push((p.pos, regen_r)); }
-            }
-        }
         self.regen_candidates_batch(&regen_regions);
 
-        self.particle_grid.clear_physics_for_cells(&initialized_cells);
+        let initialized: HashSet<(i64, i64)> = keys.iter().copied().collect();
+        self.particle_grid.clear_physics_for_cells(&initialized);
     }
-
 
     /// Return a JSON string with per-type metadata (color, radius) for the renderer.
     pub fn type_metadata_json(&self) -> String {
