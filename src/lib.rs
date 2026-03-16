@@ -20,7 +20,7 @@ use wasm_bindgen::prelude::*;
 /// const sim = new CrystalSim(JSON.stringify(config));
 /// sim.step(500);
 /// const ptr = sim.particle_buffer();
-/// const buf = new Float32Array(sim.memory().buffer, ptr, sim.particle_count() * 4);
+/// const buf = new Float32Array(sim.memory().buffer, ptr, sim.particle_count() * 5);
 /// ```
 #[wasm_bindgen]
 pub struct CrystalSim {
@@ -44,9 +44,9 @@ impl CrystalSim {
     }
 
     /// Byte offset into WASM linear memory of the particle buffer.
-    /// Buffer layout: [x0, y0, type0, radius0, x1, y1, type1, radius1, ...]  (f32, stride 4)
+    /// Buffer layout: [x, y, type_id, radius, orientation]  per particle (f32, stride 5)
     ///
-    /// JS: `new Float32Array(wasm.memory.buffer, sim.particle_buffer(), sim.particle_count() * 4)`
+    /// JS: `new Float32Array(wasm.memory.buffer, sim.particle_buffer(), sim.particle_count() * 5)`
     pub fn particle_buffer(&self) -> u32 {
         self.inner.particle_buf_ptr() as u32
     }
@@ -76,5 +76,16 @@ impl CrystalSim {
     /// JSON array of per-type metadata: [{"color":"#hex","radius":r}, ...]
     pub fn type_metadata_json(&self) -> String {
         self.inner.type_metadata_json()
+    }
+
+    /// Byte offset into WASM memory of the candidate buffer.
+    /// Layout per candidate: [x, y, type_id, rate]  (f32, stride 4)
+    pub fn candidate_buffer(&self) -> u32 {
+        self.inner.candidate_buf_ptr() as u32
+    }
+
+    /// Number of candidate sites currently tracked.
+    pub fn candidate_count(&self) -> u32 {
+        self.inner.candidate_count()
     }
 }

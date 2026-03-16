@@ -5,7 +5,7 @@ use crystal_sim::kmc::Simulation;
 const DEFAULT_CONFIG: &str = r##"{
     "particle_types": [
         {"radius": 0.5, "color": "#4488ff", "mu": 3.5},
-        {"radius": 0.5, "color": "#ff6644", "mu": 3.5}, 
+        {"radius": 0.5, "color": "#ff6644", "mu": 3.5},
         {"radius": 0.5, "color": "#0cee44", "mu": 3.5}
 
     ],
@@ -23,7 +23,7 @@ const DEFAULT_CONFIG: &str = r##"{
 // const DEFAULT_CONFIG: &str = r##"{
 //     "particle_types": [
 //         {"radius": 0.5, "color": "#4488ff", "mu": 3.5},
-//         {"radius": 0.5, "color": "#ff6644", "mu": 3.5}, 
+//         {"radius": 0.5, "color": "#ff6644", "mu": 3.5},
 //     ],
 //     "epsilon": [[-10.0, 1.0], [1.0, -10.0]],
 //     "delta": 0.15,
@@ -49,9 +49,10 @@ struct CrystalApp {
     zoom: f32,
     pan: Vec2,
     colors: Vec<Color32>,
-    temperature: f64,
-    mu: Vec<f64>,
+    temperature: f32,
+    mu: Vec<f32>,
     show_bonds: bool,
+    show_candidates: bool,
 }
 
 impl CrystalApp {
@@ -74,14 +75,15 @@ impl CrystalApp {
             temperature,
             mu,
             show_bonds: true,
+            show_candidates: false,
         }
     }
 
-    fn sim_to_screen(&self, sim_x: f64, sim_y: f64, rect: Rect) -> Pos2 {
+    fn sim_to_screen(&self, sim_x: f32, sim_y: f32, rect: Rect) -> Pos2 {
         let center = rect.center();
         Pos2::new(
-            center.x + (sim_x as f32 + self.pan.x) * self.zoom,
-            center.y - (sim_y as f32 + self.pan.y) * self.zoom,
+            center.x + (sim_x + self.pan.x) * self.zoom,
+            center.y - (sim_y + self.pan.y) * self.zoom,
         )
     }
 
@@ -89,16 +91,16 @@ impl CrystalApp {
         if self.sim.particle_count() == 0 {
             return;
         }
-        let mut cx = 0.0f64;
-        let mut cy = 0.0f64;
+        let mut cx = 0.0f32;
+        let mut cy = 0.0f32;
         let mut n = 0;
         for p in self.sim.particle_grid.iter() {
             cx += p.pos.x;
             cy += p.pos.y;
             n += 1;
         }
-        let n = n as f64;
-        self.pan = Vec2::new(-(cx / n) as f32, -(cy / n) as f32);
+        let n = n as f32;
+        self.pan = Vec2::new(-(cx / n), -(cy / n));
     }
 }
 
@@ -118,8 +120,14 @@ impl eframe::App for CrystalApp {
                 if ui.button(label).clicked() {
                     self.running = !self.running;
                 }
-                if ui.button("Step").clicked() {
-                    self.sim.step(self.steps_per_frame);
+                if ui.button("1").clicked() {
+                    self.sim.step(1);
+                }
+                if ui.button("10").clicked() {
+                    self.sim.step(10);
+                }
+                if ui.button("100").clicked() {
+                    self.sim.step(100);
                 }
                 if ui.button("Reset").clicked() {
                     let mut config: SimConfig =
@@ -168,6 +176,7 @@ impl eframe::App for CrystalApp {
             ui.separator();
 
             ui.checkbox(&mut self.show_bonds, "Show bonds");
+            ui.checkbox(&mut self.show_candidates, "Show candidates");
 
             ui.separator();
 
@@ -233,6 +242,29 @@ impl eframe::App for CrystalApp {
             //     }
             // }
 
+            // Candidate sites
+            if self.show_candidates && !self.sim.candidates.is_empty() {
+                let max_rate = (0..self.sim.candidates.len())
+                    .map(|i| self.sim.attach_rates.get_rate(i))
+                    .fold(0.0f64, f64::max);
+                let max_rate = if max_rate > 0.0 { max_rate } else { 1.0 };
+
+                for (i, site) in self.sim.candidates.iter().enumerate() {
+                    let pos = self.sim_to_screen(site.pos.x, site.pos.y, rect);
+                    if pos.x < rect.left() - 20.0 || pos.x > rect.right() + 20.0
+                        || pos.y < rect.top() - 20.0 || pos.y > rect.bottom() + 20.0
+                    {
+                        continue;
+                    }
+                    let t = (self.sim.attach_rates.get_rate(i) / max_rate) as f32;
+                    let dot_r = 1.5 + t * 4.5;
+                    let alpha = ((0.25 + t * 0.55) * 255.0) as u8;
+                    let color = self.colors.get(site.type_id).copied().unwrap_or(Color32::WHITE);
+                    let [r, g, b, _] = color.to_array();
+                    painter.circle_filled(pos, dot_r, Color32::from_rgba_unmultiplied(r, g, b, alpha));
+                }
+            }
+
             // Particles
             for particle in self.sim.particle_grid.iter() {
                 let pos = self.sim_to_screen(particle.pos.x, particle.pos.y, rect);
@@ -244,7 +276,7 @@ impl eframe::App for CrystalApp {
                 {
                     continue;
                 }
-                let screen_r = (particle.radius - self.sim.config.delta) as f32 * self.zoom;
+                let screen_r = (particle.radius - self.sim.config.delta) * self.zoom;
                 if screen_r < 0.5 {
                     continue;
                 }
@@ -260,6 +292,33 @@ impl eframe::App for CrystalApp {
                         screen_r,
                         Stroke::new(0.8, Color32::from_rgba_unmultiplied(255, 255, 255, 50)),
                     );
+                }
+
+                // Patch markers: draw small squares on the particle boundary.
+                if let Some(type_def) = self.sim.config.particle_types.get(particle.type_id) {
+                    let patch_half = (screen_r * 0.18).max(1.5);
+                    for patch in &type_def.patches {
+                        let n = crystal_sim::forces::patch_dir(particle.orientation, patch.position_cs);
+                        let ux = n.x;
+                        let uy = -n.y; // screen-space y is flipped
+                        let vx = -uy;
+                        let vy = ux;
+
+                        let cx = pos.x + ux * screen_r;
+                        let cy = pos.y + uy * screen_r;
+                        let c = Pos2::new(cx, cy);
+
+                        let p0 = Pos2::new(c.x - ux * patch_half - vx * patch_half, c.y - uy * patch_half - vy * patch_half);
+                        let p1 = Pos2::new(c.x + ux * patch_half - vx * patch_half, c.y + uy * patch_half - vy * patch_half);
+                        let p2 = Pos2::new(c.x + ux * patch_half + vx * patch_half, c.y + uy * patch_half + vy * patch_half);
+                        let p3 = Pos2::new(c.x - ux * patch_half + vx * patch_half, c.y - uy * patch_half + vy * patch_half);
+
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![p0, p1, p2, p3],
+                            Color32::from_rgb(245, 245, 245),
+                            Stroke::new(0.8, Color32::from_rgba_unmultiplied(20, 20, 20, 180)),
+                        ));
+                    }
                 }
             }
         });

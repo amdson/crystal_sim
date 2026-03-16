@@ -1,10 +1,10 @@
 {
     "particle_types": [
-        {"radius": 0.9, "color": "#4488ff", "mu": 0.01},
-        {"radius": 2.0, "color": "#ff6644", "mu": 0.01}
+        {"radius": 1.0, "color": "#4488ff", "mu": 0.01},
+        {"radius": 1.0, "color": "#ff6644", "mu": 0.01}
     ], 
-    "epsilon": [[-35.0, 3.0], [3.0, -7.0]], 
-    "delta": 0.2, 
+    "epsilon": [[-35.0, 3.0], [3.0, -35.0]], 
+    "delta": 0.1, 
     "temperature": 2.0, 
     "nu": 0.01, 
     "seed": 42, 

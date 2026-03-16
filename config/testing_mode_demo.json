@@ -1,0 +1,43 @@
+{
+  "particle_types": [
+    {
+      "radius": 1.0,
+      "color": "#4a90d9",
+      "mu": 0.0,
+      "patches": [
+        { "patch_type": "A", "position_deg": 20.0 },
+        { "patch_type": "B", "position_deg": 160.0 }
+      ]
+    }
+  ],
+  "epsilon": [[0.0]],
+  "delta": 0.12,
+  "temperature": 1.0,
+  "nu": 0.05,
+  "seed": 7,
+  "num_isolated_angles": 32,
+  "max_arc_sites_per_type": 6,
+  "relax_steps": 60,
+  "relax_alpha": 0.015,
+  "spring_k": 10.0,
+  "steps_per_frame": 20,
+  "static_friction": 0.08,
+  "lj_cutoff_factor": 3.0,
+  "relax_damping": 0.8,
+  "patch_interactions": [
+    {
+      "types": ["A", "B"],
+      "epsilon": -10.0,
+      "angular_width_deg": [40, 40],
+      "cutoff": 1.35
+    }
+  ],
+  "testing_mode": true,
+  "print_test_diagnostics": true,
+  "initial_particles": [
+    { "x": 0.0, "y": 0.0, "type_id": 0, "orientation_deg": 0.0, "frozen": true },
+    { "x": 2.1, "y": 0.0, "type_id": 0, "orientation_deg": 0.0 },
+    { "x": 4.0, "y": 0.7, "type_id": 0, "orientation_deg": 0.0 },
+    { "x": 5.8, "y": 1.8, "type_id": 0, "orientation_deg": 0.0 }
+  ]
+}

@@ -15,8 +15,8 @@
 
       <section>
         <label>Steps / frame
-          <input id="stepsPerFrame" type="range" min="1" max="2000" value="200" />
-          <span id="stepsPerFrameVal">200</span>
+          <input id="stepsPerFrame" type="range" min="1" max="200" value="10" />
+          <span id="stepsPerFrameVal">10</span>
         </label>
       </section>
 
@@ -42,11 +42,35 @@
         <label>
           <input id="showBonds" type="checkbox" checked /> Show bonds
         </label>
+        <label>
+          <input id="showCandidates" type="checkbox" /> Show candidates
+        </label>
       </section>
 
       <section>
         <button id="pauseBtn">Pause</button>
+        <button id="stepBtn">Step</button>
         <button id="resetBtn">Reset</button>
+      </section>
+
+      <section id="configSection">
+        <h3>Config</h3>
+        <select id="configSelect">
+          <option value="/config/rippled.json">rippled</option>
+          <option value="/config/checkerboard.json" selected>checkerboard</option>
+          <option value="/config/staggered.json">staggered</option>
+          <option value="/config/chess_grid.json">chess_grid</option>
+          <option value="/config/chevron.json">chevron</option>
+          <option value="/config/spiral_chain.json">spiral_chain</option>
+          <option value="/config/debug.json">debug</option>
+        </select>
+        <button id="loadConfigBtn">Load</button>
+        <details id="jsonEditorDetails">
+          <summary>Edit JSON</summary>
+          <textarea id="configJson" rows="12" spellcheck="false"></textarea>
+          <button id="applyJsonBtn">Apply JSON</button>
+          <div id="jsonError" style="color:#f66;font-size:0.8em;margin-top:4px;"></div>
+        </details>
       </section>
     </aside>
   </div>

@@ -1,20 +1,21 @@
-use glam::DVec2;
+use glam::Vec2;
 
 /// A potential attachment location for a particle of `type_id`.
 #[derive(Clone, Debug)]
 pub struct CandidateSite {
-    pub pos: DVec2,
+    pub pos: Vec2,
     pub type_id: usize,
+    pub orientation: Vec2,  // unit vector
 }
 
 /// Compute the (up to 2) intersection points of two circles.
 ///
 /// Circle 1: center `a`, radius `r1`
 /// Circle 2: center `b`, radius `r2`
-pub fn circle_intersections(a: DVec2, r1: f64, b: DVec2, r2: f64) -> [Option<DVec2>; 2] {
+pub fn circle_intersections(a: Vec2, r1: f32, b: Vec2, r2: f32) -> [Option<Vec2>; 2] {
     let d_vec = b - a;
     let d = d_vec.length();
-    
+
     if d < 1e-12 {
         return [None, None]; // coincident centres
     }
@@ -38,7 +39,7 @@ pub fn circle_intersections(a: DVec2, r1: f64, b: DVec2, r2: f64) -> [Option<DVe
     }
 
     let h = h_sq.sqrt();
-    let perp = DVec2::new(-d_vec.y, d_vec.x) * (h / d);
+    let perp = Vec2::new(-d_vec.y, d_vec.x) * (h / d);
     [Some(mid + perp), Some(mid - perp)]
 }
 
@@ -48,12 +49,12 @@ pub fn circle_intersections(a: DVec2, r1: f64, b: DVec2, r2: f64) -> [Option<DVe
 /// `nearby_indices` should come from a spatial hash query with an appropriate radius;
 /// `particles_pos` and `particles_radius` are parallel slices indexed by those indices.
 pub fn site_has_overlap(
-    pos: DVec2,
-    rc: f64,
-    delta: f64,
+    pos: Vec2,
+    rc: f32,
+    delta: f32,
     nearby: &[usize],
-    positions: &[DVec2],
-    radii: &[f64],
+    positions: &[Vec2],
+    radii: &[f32],
 ) -> bool {
     for &idx in nearby {
         let contact = rc + radii[idx];

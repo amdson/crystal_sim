@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use glam::DVec2;
+use glam::Vec2;
 
 use crate::forces::lj_force_vec;
 use crate::particle::Particle;
@@ -7,27 +7,27 @@ use crate::particle::Particle;
 /// Unbounded grid-based spatial hash. Cell size is set to the largest bonding
 /// cutoff so a single-ring of cells always covers the full interaction range.
 pub struct SpatialHash {
-    cell_size: f64,
+    cell_size: f32,
     cells: HashMap<(i64, i64), Vec<usize>>,
 }
 
 impl SpatialHash {
-    pub fn new(cell_size: f64) -> Self {
+    pub fn new(cell_size: f32) -> Self {
         Self { cell_size, cells: HashMap::new() }
     }
 
-    fn key(&self, x: f64, y: f64) -> (i64, i64) {
+    fn key(&self, x: f32, y: f32) -> (i64, i64) {
         (
             x.div_euclid(self.cell_size).floor() as i64,
             y.div_euclid(self.cell_size).floor() as i64,
         )
     }
 
-    pub fn insert(&mut self, idx: usize, x: f64, y: f64) {
+    pub fn insert(&mut self, idx: usize, x: f32, y: f32) {
         self.cells.entry(self.key(x, y)).or_default().push(idx);
     }
 
-    pub fn remove(&mut self, idx: usize, x: f64, y: f64) {
+    pub fn remove(&mut self, idx: usize, x: f32, y: f32) {
         let k = self.key(x, y);
         if let Some(v) = self.cells.get_mut(&k) {
             if let Some(p) = v.iter().position(|&i| i == idx) {
@@ -36,7 +36,7 @@ impl SpatialHash {
         }
     }
 
-    pub fn batch_remove(&mut self, entries: &[(usize, f64, f64)]) {
+    pub fn batch_remove(&mut self, entries: &[(usize, f32, f32)]) {
         for &(idx, x, y) in entries {
             let k = self.key(x, y);
             if let Some(v) = self.cells.get_mut(&k) {
@@ -47,13 +47,13 @@ impl SpatialHash {
         }
     }
 
-    pub fn query(&self, cx: f64, cy: f64, radius: f64) -> Vec<usize> {
+    pub fn query(&self, cx: f32, cy: f32, radius: f32) -> Vec<usize> {
         let mut result = Vec::new();
         self.query_into(cx, cy, radius, &mut result);
         result
     }
 
-    pub fn query_into(&self, cx: f64, cy: f64, radius: f64, out: &mut Vec<usize>) {
+    pub fn query_into(&self, cx: f32, cy: f32, radius: f32, out: &mut Vec<usize>) {
         out.clear();
         let min_gx = ((cx - radius) / self.cell_size).floor() as i64;
         let max_gx = ((cx + radius) / self.cell_size).floor() as i64;
@@ -75,35 +75,42 @@ impl SpatialHash {
 /// Per-cell struct-of-arrays.  All Vecs inside a `Cell` are kept the same
 /// length; `swap_remove` on one must be mirrored across all others.
 pub struct Cell {
-    pub particles:  Vec<Particle>,
-    pub rates:      Vec<f64>,
-    pub aggr_rate:  f64,
-    pub velocities: Vec<DVec2>,
-    pub new_pos:    Vec<DVec2>,
-    pub is_active:  Vec<bool>,
-    pub is_frozen:  Vec<bool>,
+    pub particles:       Vec<Particle>,
+    pub rates:           Vec<f64>,
+    pub aggr_rate:       f64,
+    pub velocities:      Vec<Vec2>,
+    pub new_pos:         Vec<Vec2>,
+    pub ang_velocities:  Vec<f32>,
+    pub new_orientation: Vec<Vec2>,
+    pub is_active:       Vec<bool>,
+    pub is_frozen:       Vec<bool>,
 }
 
 impl Cell {
     fn new() -> Self {
         Self {
-            particles:  Vec::new(),
-            rates:      Vec::new(),
-            aggr_rate:  0.0,
-            velocities: Vec::new(),
-            new_pos:    Vec::new(),
-            is_active:  Vec::new(),
-            is_frozen:  Vec::new(),
+            particles:       Vec::new(),
+            rates:           Vec::new(),
+            aggr_rate:       0.0,
+            velocities:      Vec::new(),
+            new_pos:         Vec::new(),
+            ang_velocities:  Vec::new(),
+            new_orientation: Vec::new(),
+            is_active:       Vec::new(),
+            is_frozen:       Vec::new(),
         }
     }
 
     fn push(&mut self, p: Particle, rate: f64) {
         let pos = p.pos;
+        let ori = p.orientation;
         self.aggr_rate += rate;
         self.particles.push(p);
         self.rates.push(rate);
-        self.velocities.push(DVec2::ZERO);
+        self.velocities.push(Vec2::ZERO);
         self.new_pos.push(pos);
+        self.ang_velocities.push(0.0);
+        self.new_orientation.push(ori);
         self.is_active.push(false);
         self.is_frozen.push(false);
     }
@@ -114,6 +121,8 @@ impl Cell {
         self.aggr_rate -= rate;
         self.velocities.swap_remove(ind);
         self.new_pos.swap_remove(ind);
+        self.ang_velocities.swap_remove(ind);
+        self.new_orientation.swap_remove(ind);
         self.is_active.swap_remove(ind);
         self.is_frozen.swap_remove(ind);
         (p, rate)
@@ -127,26 +136,29 @@ impl Cell {
 /// lets the relaxation hot loop use `cells[idx]` (one array offset) instead of
 /// a HashMap lookup.
 ///
-/// `cell_forces` is a separate parallel `Vec` so that `accumulate_lj_forces`
-/// can hold `&cells` and `&mut cell_forces` simultaneously via field splitting.
+/// `cell_forces` and `cell_torques` are separate parallel `Vec`s so that the
+/// force accumulation loop can hold `&cells` and `&mut cell_forces`/`&mut cell_torques`
+/// simultaneously via field splitting.
 pub struct ParticleGrid {
-    pub cell_size:   f64,
-    pub cells:       Vec<Cell>,           // append-only; indices are stable forever
-    pub cell_forces: Vec<Vec<DVec2>>,     // parallel to `cells`
-    pub cell_map:    HashMap<(i64, i64), usize>,
+    pub cell_size:    f32,
+    pub cells:        Vec<Cell>,           // append-only; indices are stable forever
+    pub cell_forces:  Vec<Vec<Vec2>>,      // parallel to `cells`
+    pub cell_torques: Vec<Vec<f32>>,       // parallel to `cells`
+    pub cell_map:     HashMap<(i64, i64), usize>,
 }
 
 impl ParticleGrid {
-    pub fn new(cell_size: f64) -> Self {
+    pub fn new(cell_size: f32) -> Self {
         Self {
             cell_size,
-            cells:       Vec::new(),
-            cell_forces: Vec::new(),
-            cell_map:    HashMap::new(),
+            cells:        Vec::new(),
+            cell_forces:  Vec::new(),
+            cell_torques: Vec::new(),
+            cell_map:     HashMap::new(),
         }
     }
 
-    pub fn cell_key(&self, x: f64, y: f64) -> (i64, i64) {
+    pub fn cell_key(&self, x: f32, y: f32) -> (i64, i64) {
         (
             x.div_euclid(self.cell_size).floor() as i64,
             y.div_euclid(self.cell_size).floor() as i64,
@@ -161,6 +173,7 @@ impl ParticleGrid {
         let idx = self.cells.len();
         self.cells.push(Cell::new());
         self.cell_forces.push(Vec::new());
+        self.cell_torques.push(Vec::new());
         self.cell_map.insert(key, idx);
         idx
     }
@@ -169,7 +182,8 @@ impl ParticleGrid {
         let key = self.cell_key(p.pos.x, p.pos.y);
         let idx = self.get_or_create(key);
         self.cells[idx].push(p, rate);
-        self.cell_forces[idx].push(DVec2::ZERO);
+        self.cell_forces[idx].push(Vec2::ZERO);
+        self.cell_torques[idx].push(0.0);
     }
 
     /// Remove the particle at `(cell_idx, ind)`.  The `Cell` struct stays; only
@@ -177,6 +191,7 @@ impl ParticleGrid {
     pub fn swap_remove(&mut self, cell_idx: usize, ind: usize) -> (Particle, f64) {
         let (p, rate) = self.cells[cell_idx].swap_remove(ind);
         self.cell_forces[cell_idx].swap_remove(ind);
+        self.cell_torques[cell_idx].swap_remove(ind);
         (p, rate)
     }
 
@@ -201,13 +216,13 @@ impl ParticleGrid {
         None
     }
 
-    pub fn query(&self, cx: f64, cy: f64, radius: f64) -> Vec<Particle> {
+    pub fn query(&self, cx: f32, cy: f32, radius: f32) -> Vec<Particle> {
         let mut result = Vec::new();
         self.query_into(cx, cy, radius, &mut result);
         result
     }
 
-    pub fn query_into(&self, cx: f64, cy: f64, radius: f64, out: &mut Vec<Particle>) {
+    pub fn query_into(&self, cx: f32, cy: f32, radius: f32, out: &mut Vec<Particle>) {
         out.clear();
         let min_gx = ((cx - radius) / self.cell_size).floor() as i64;
         let max_gx = ((cx + radius) / self.cell_size).floor() as i64;
@@ -227,7 +242,7 @@ impl ParticleGrid {
         self.cells.iter().map(|c| c.aggr_rate).sum()
     }
 
-    pub fn set_rate(&mut self, pos: DVec2, new_rate: f64) {
+    pub fn set_rate(&mut self, pos: Vec2, new_rate: f64) {
         let key = self.cell_key(pos.x, pos.y);
         if let Some(&idx) = self.cell_map.get(&key) {
             let cell = &mut self.cells[idx];
@@ -246,7 +261,7 @@ impl ParticleGrid {
         self.cells.iter().map(|c| c.particles.len()).sum()
     }
 
-    pub fn query_iter<F>(&self, cx: f64, cy: f64, radius: f64, mut f: F)
+    pub fn query_iter<F>(&self, cx: f32, cy: f32, radius: f32, mut f: F)
     where
         F: FnMut(&Particle),
     {
@@ -271,7 +286,7 @@ impl ParticleGrid {
 
     // ── Physics state helpers ─────────────────────────────────────────────────
 
-    pub fn mark_active(&mut self, key: (i64, i64), ind: usize, initial_vel: DVec2) {
+    pub fn mark_active(&mut self, key: (i64, i64), ind: usize, initial_vel: Vec2) {
         if let Some(&idx) = self.cell_map.get(&key) {
             let cell = &mut self.cells[idx];
             cell.is_active[ind] = true;
@@ -285,16 +300,21 @@ impl ParticleGrid {
             let n = {
                 let cell = &mut self.cells[idx];
                 for i in 0..cell.particles.len() {
-                    cell.velocities[i] = DVec2::ZERO;
-                    cell.new_pos[i]    = cell.particles[i].pos;
-                    cell.is_active[i]  = false;
-                    cell.is_frozen[i]  = false;
+                    cell.velocities[i]      = Vec2::ZERO;
+                    cell.new_pos[i]         = cell.particles[i].pos;
+                    cell.ang_velocities[i]  = 0.0;
+                    cell.new_orientation[i] = cell.particles[i].orientation;
+                    cell.is_active[i]       = false;
+                    cell.is_frozen[i]       = false;
                 }
                 cell.particles.len()
             };
             let fs = &mut self.cell_forces[idx];
-            fs.resize(n, DVec2::ZERO);
-            for f in fs.iter_mut() { *f = DVec2::ZERO; }
+            fs.resize(n, Vec2::ZERO);
+            for f in fs.iter_mut() { *f = Vec2::ZERO; }
+            let ts = &mut self.cell_torques[idx];
+            ts.resize(n, 0.0);
+            for t in ts.iter_mut() { *t = 0.0; }
         }
     }
 
@@ -310,7 +330,8 @@ impl ParticleGrid {
                 if !self.cells[cell_idx].is_active[ind] { continue; }
                 let new_pos = self.cells[cell_idx].new_pos[ind];
                 if self.cell_key(new_pos.x, new_pos.y) == key {
-                    self.cells[cell_idx].particles[ind].pos = new_pos;
+                    self.cells[cell_idx].particles[ind].pos         = new_pos;
+                    self.cells[cell_idx].particles[ind].orientation = self.cells[cell_idx].new_orientation[ind];
                 } else {
                     cross_inds.push(ind);
                 }
@@ -318,20 +339,30 @@ impl ParticleGrid {
 
             cross_inds.sort_unstable_by(|a, b| b.cmp(a));
             for ind in cross_inds {
-                let (new_pos, vel, is_act, is_frz, rate) = {
+                let (new_pos, new_ori, vel, omega, is_act, is_frz, rate) = {
                     let c = &self.cells[cell_idx];
-                    (c.new_pos[ind], c.velocities[ind], c.is_active[ind], c.is_frozen[ind], c.rates[ind])
+                    (
+                        c.new_pos[ind],
+                        c.new_orientation[ind],
+                        c.velocities[ind],
+                        c.ang_velocities[ind],
+                        c.is_active[ind],
+                        c.is_frozen[ind],
+                        c.rates[ind],
+                    )
                 };
                 let (mut p, _) = self.swap_remove(cell_idx, ind);
-                p.pos = new_pos;
+                p.pos         = new_pos;
+                p.orientation = new_ori;
                 let target_key = self.cell_key(new_pos.x, new_pos.y);
                 self.insert(p, rate); // get_or_create + push
                 let target_idx = self.cell_map[&target_key];
                 let last = self.cells[target_idx].particles.len() - 1;
                 let tc = &mut self.cells[target_idx];
-                tc.velocities[last] = vel;
-                tc.is_active[last]  = is_act;
-                tc.is_frozen[last]  = is_frz;
+                tc.velocities[last]     = vel;
+                tc.ang_velocities[last] = omega;
+                tc.is_active[last]      = is_act;
+                tc.is_frozen[last]      = is_frz;
                 moved_to.insert(target_key);
             }
         }
@@ -343,12 +374,15 @@ impl ParticleGrid {
             let Some(&idx) = self.cell_map.get(&key) else { continue };
             let cell = &mut self.cells[idx];
             for i in 0..cell.particles.len() {
-                cell.velocities[i] = DVec2::ZERO;
-                cell.new_pos[i]    = cell.particles[i].pos;
-                cell.is_active[i]  = false;
-                cell.is_frozen[i]  = false;
+                cell.velocities[i]      = Vec2::ZERO;
+                cell.new_pos[i]         = cell.particles[i].pos;
+                cell.ang_velocities[i]  = 0.0;
+                cell.new_orientation[i] = cell.particles[i].orientation;
+                cell.is_active[i]       = false;
+                cell.is_frozen[i]       = false;
             }
-            for f in self.cell_forces[idx].iter_mut() { *f = DVec2::ZERO; }
+            for f in self.cell_forces[idx].iter_mut() { *f = Vec2::ZERO; }
+            for t in self.cell_torques[idx].iter_mut() { *t = 0.0; }
         }
     }
 }
@@ -365,12 +399,12 @@ impl ParticleGrid {
 /// operation creates a temporary borrow that is released before the next.
 pub fn accumulate_lj_forces(
     cells:        &[Cell],
-    cell_forces:  &mut [Vec<DVec2>],
+    cell_forces:  &mut [Vec<Vec2>],
     cell_map:     &HashMap<(i64, i64), usize>,
     active_cells: &HashSet<(i64, i64)>,
-    cell_size:    f64,
-    max_radius:   f64,
-    lj_cutoff_factor: f64,
+    cell_size:    f32,
+    max_radius:   f32,
+    lj_cutoff_factor: f32,
 ) {
     let query_r = max_radius * lj_cutoff_factor * 2.0 + 1e-6;
     let cell_r  = (query_r / cell_size).ceil() as i64;
@@ -398,7 +432,7 @@ pub fn accumulate_lj_forces(
                         let r_contact = a_r + b_r;
                         let f = -lj_force_vec(b_pos - a_pos, r_contact, 1.0,
                                               r_contact * lj_cutoff_factor);
-                        if f == DVec2::ZERO { continue; }
+                        if f == Vec2::ZERO { continue; }
 
                         // Sequential borrows — each is a temporary &mut released immediately.
                         if ai < cell_forces[ai_idx].len() { cell_forces[ai_idx][ai] += f; }
@@ -420,13 +454,13 @@ pub fn accumulate_lj_forces(
 /// Returns `(converged, newly_activated_cells)`.
 pub fn step_velocities_and_activate(
     cells:          &mut [Cell],
-    cell_forces:    &[Vec<DVec2>],
+    cell_forces:    &[Vec<Vec2>],
     cell_map:       &HashMap<(i64, i64), usize>,
     active_cells:   &HashSet<(i64, i64)>,
     neighbor_cells: &HashSet<(i64, i64)>,
-    alpha:           f64,
-    damping:         f64,
-    static_friction: f64,
+    alpha:           f32,
+    damping:         f32,
+    static_friction: f32,
     max_active_cells: usize,
 ) -> (bool, HashSet<(i64, i64)>) {
     let mut converged = true;
@@ -439,16 +473,16 @@ pub fn step_velocities_and_activate(
         for ind in 0..cell.particles.len() {
             if !cell.is_active[ind] { continue; }
 
-            let f_raw     = forces.get(ind).copied().unwrap_or(DVec2::ZERO);
+            let f_raw     = forces.get(ind).copied().unwrap_or(Vec2::ZERO);
             let f_clamped = f_raw.clamp_length_max(1.0);
-            let f_eff = f_clamped; 
+            let f_eff = f_clamped;
             // let f_mag     = f_clamped.length();
             // let f_eff     = if f_mag > static_friction {
             //     f_clamped * ((f_mag - static_friction) / f_mag)
-            // } else { DVec2::ZERO };
+            // } else { Vec2::ZERO };
 
             let v_raw = damping * cell.velocities[ind] + alpha * f_eff;
-            let v_new = if v_raw.dot(f_eff) >= 0.0 { v_raw } else { DVec2::ZERO };
+            let v_new = if v_raw.dot(f_eff) >= 0.0 { v_raw } else { Vec2::ZERO };
 
             cell.new_pos[ind]    = cell.particles[ind].pos + v_new;
             cell.velocities[ind] = v_new;
@@ -472,7 +506,7 @@ pub fn step_velocities_and_activate(
 
         for ind in 0..cell.particles.len() {
             if cell.is_frozen[ind] || cell.is_active[ind] { continue; }
-            let f     = forces.get(ind).copied().unwrap_or(DVec2::ZERO);
+            let f     = forces.get(ind).copied().unwrap_or(Vec2::ZERO);
             let f_mag = f.length();
             if f_mag > static_friction {
                 let vel = alpha * f * ((f_mag - static_friction) / f_mag);
