@@ -1,0 +1,487 @@
+/* editor.css — Styles for docs/editor.html
+ * Inherits base tokens from styles.css (dark background, fonts, buttons).
+ */
+
+/* ── Reset body for editor layout ──────────────────────────────────────────── */
+
+body {
+  overflow: hidden;  /* editor handles scrolling per-panel */
+}
+
+#editor-app {
+  display: grid;
+  grid-template-rows: 44px 1fr auto;
+  height: 100vh;
+  min-width: 1100px;
+}
+
+/* ── Header ────────────────────────────────────────────────────────────────── */
+
+#editor-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 16px;
+  background: #0f1018;
+  border-bottom: 1px solid #252635;
+  flex-shrink: 0;
+}
+
+.editor-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #c0c0e8;
+  letter-spacing: 0.04em;
+  margin-right: auto;
+}
+
+.header-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* ── Panels row ────────────────────────────────────────────────────────────── */
+
+#panels-row {
+  display: grid;
+  grid-template-columns: 300px 320px 1fr;
+  overflow: hidden;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  border-right: 1px solid #1e1f2a;
+  background: #0f1018;
+  padding: 12px;
+}
+
+.panel-physics {
+  overflow: hidden;  /* physics panel manages its own scroll */
+  padding: 0;
+}
+
+/* ── Panel titles ──────────────────────────────────────────────────────────── */
+
+.panel-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #c8c8e8;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #252635;
+  flex-shrink: 0;
+}
+
+.section-subtitle {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #606080;
+  margin-bottom: 8px;
+}
+
+/* ── Buttons ────────────────────────────────────────────────────────────────── */
+
+.btn {
+  background: #1e2035;
+  border: 1px solid #30325a;
+  color: #b0b0d0;
+  padding: 5px 11px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.12s;
+  white-space: nowrap;
+}
+
+.btn:hover { background: #272950; }
+.btn:active { background: #323465; }
+
+.btn-primary {
+  background: #3040a0;
+  border-color: #4050c0;
+  color: #e0e0f8;
+}
+.btn-primary:hover { background: #3850b8; }
+
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: #606080;
+}
+.btn-ghost:hover { color: #9090b0; background: transparent; }
+
+.btn-add {
+  font-size: 11px;
+  padding: 4px 9px;
+  margin-bottom: 10px;
+}
+
+/* ── Patch palette (Panel 1) ────────────────────────────────────────────────── */
+
+.patch-palette {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 14px;
+  align-items: center;
+}
+
+.patch-token {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: #1a1b2a;
+  border: 1px solid #2e2f45;
+  border-radius: 20px;
+  padding: 3px 6px 3px 4px;
+  cursor: grab;
+  user-select: none;
+  transition: border-color 0.15s;
+}
+
+.patch-token:hover { border-color: #5050a0; }
+.patch-token:active { cursor: grabbing; }
+
+.patch-swatch {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid rgba(255,255,255,0.15);
+  flex-shrink: 0;
+}
+
+.patch-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: #d0d0e8;
+  min-width: 14px;
+  outline: none;
+  cursor: text;
+}
+
+.patch-name:focus { border-bottom: 1px dashed #6060a0; }
+
+.patch-delete {
+  font-size: 13px;
+  color: #606080;
+  background: none;
+  border: none;
+  padding: 0 2px;
+  cursor: pointer;
+  line-height: 1;
+}
+.patch-delete:hover { color: #e84040; }
+
+/* ── Interaction table ────────────────────────────────────────────────────── */
+
+.interaction-section {
+  border-top: 1px solid #1e1f2a;
+  padding-top: 10px;
+}
+
+.interaction-table-wrapper {
+  overflow-x: auto;
+}
+
+.interaction-table {
+  border-collapse: collapse;
+  font-size: 11px;
+  width: 100%;
+}
+
+.interaction-table th,
+.interaction-table td {
+  border: 1px solid #1e1f2a;
+  padding: 5px 7px;
+  text-align: center;
+  min-width: 42px;
+}
+
+.interaction-table thead th {
+  background: #131420;
+  font-weight: 700;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+
+.interaction-table tbody th {
+  background: #131420;
+  font-weight: 700;
+  font-size: 10px;
+}
+
+.interaction-cell.editable {
+  cursor: pointer;
+  transition: filter 0.1s;
+}
+.interaction-cell.editable:hover {
+  filter: brightness(1.5);
+  outline: 1px solid #6060c0;
+}
+
+.interaction-cell.mirror {
+  background: #0d0e16;
+  color: #50507a;
+}
+
+/* ── Interaction popover ──────────────────────────────────────────────────── */
+
+.interaction-popover {
+  background: #181928;
+  border: 1px solid #30325a;
+  border-radius: 6px;
+  padding: 10px 12px;
+  min-width: 170px;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+}
+
+.popover-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: #a0a0c8;
+  margin-bottom: 8px;
+  letter-spacing: 0.06em;
+}
+
+.popover-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.popover-row label {
+  font-size: 11px;
+  color: #7070a0;
+  flex-direction: row;
+  white-space: nowrap;
+}
+
+.popover-row input {
+  width: 70px;
+  background: #111220;
+  border: 1px solid #30325a;
+  color: #c0c0e0;
+  padding: 3px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.btn-apply {
+  width: 100%;
+  margin-top: 4px;
+  background: #283080;
+  border-color: #4050c0;
+  color: #d0d0f0;
+}
+.btn-apply:hover { background: #3040a0; }
+
+/* ── Particle cards (Panel 2) ────────────────────────────────────────────── */
+
+.particle-card {
+  background: #151625;
+  border: 1px solid #252640;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: #1a1b2e;
+  border-bottom: 1px solid #252640;
+  cursor: grab;
+  user-select: none;
+}
+.card-header:active { cursor: grabbing; }
+
+.card-header input[type="color"] {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.card-name {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  color: #c0c0e0;
+}
+
+.card-delete {
+  font-size: 14px;
+  color: #505070;
+  background: none;
+  border: none;
+  padding: 0 3px;
+  cursor: pointer;
+  line-height: 1;
+}
+.card-delete:hover { color: #e84040; }
+
+.particle-canvas {
+  display: block;
+  margin: 8px auto;
+  background: #0d0e18;
+  border-radius: 4px;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.card-inputs {
+  display: flex;
+  gap: 8px;
+  padding: 6px 8px 8px;
+}
+
+.input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  flex-direction: row;
+  color: #808098;
+}
+
+.input-wrap span {
+  font-size: 11px;
+  color: #606080;
+  white-space: nowrap;
+}
+
+.input-wrap input {
+  width: 100%;
+  background: #111220;
+  border: 1px solid #252540;
+  color: #c0c0e0;
+  padding: 3px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+/* ── Panel 3 (Physics preview) ──────────────────────────────────────────── */
+
+.panel-physics {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Give the physics panel title its own padding since the panel has no padding */
+.panel-physics .panel-title {
+  padding: 10px 12px 8px;
+  margin-bottom: 0;
+}
+
+.panel3-canvas-wrapper {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: #08090c;
+}
+
+.panel3-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+  cursor: crosshair;
+}
+
+.panel3-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #0f1018;
+  border-top: 1px solid #1e1f2a;
+  flex-shrink: 0;
+}
+
+.footer-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-direction: row;
+  color: #606080;
+}
+
+.footer-input-wrap span {
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.footer-input-wrap input {
+  width: 55px;
+  background: #111220;
+  border: 1px solid #252540;
+  color: #c0c0e0;
+  padding: 3px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+/* ── JSON preview section ──────────────────────────────────────────────────── */
+
+.json-section {
+  background: #0d0e18;
+  border-top: 1px solid #1e1f2a;
+  flex-shrink: 0;
+  overflow: hidden;
+  max-height: 200px;
+  transition: max-height 0.2s ease;
+}
+
+.json-section.collapsed {
+  max-height: 32px;
+}
+
+.json-toggle-btn {
+  width: 100%;
+  border-radius: 0;
+  border: none;
+  border-bottom: 1px solid #1e1f2a;
+  background: #0f1018;
+  text-align: left;
+  padding: 6px 12px;
+  color: #606080;
+  font-size: 11px;
+  font-family: monospace;
+}
+.json-toggle-btn:hover { color: #9090b0; background: #0f1018; }
+
+.json-preview {
+  width: 100%;
+  height: 160px;
+  background: #0a0b12;
+  border: none;
+  color: #8888b8;
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 10px;
+  padding: 8px 12px;
+  resize: none;
+  outline: none;
+}
+
+/* ── Drop zone highlight ────────────────────────────────────────────────────── */
+
+.panel3-canvas-wrapper.drop-active {
+  outline: 2px dashed #6070d8;
+}
+
+/* ── Drag ghost (added by drag.js) ──────────────────────────────────────────── */
+
+.drag-ghost {
+  box-shadow: 0 2px 12px rgba(0,0,0,0.5);
+}

@@ -475,10 +475,10 @@ impl Simulation {
                 self.update_detach_rate(nb);
             }
             let regen_r = (self.config.max_cutoff() + rc) * 2.0;
-            let t0 = rdtsc();
+            // let t0 = rdtsc();
             self.regen_candidates_near(pos, regen_r);
-            self.timers[TimerEntry::RegenCandidates as usize] += rdtsc().wrapping_sub(t0);
-            self.usages[TimerEntry::RegenCandidates as usize] += 1;
+            // self.timers[TimerEntry::RegenCandidates as usize] += rdtsc().wrapping_sub(t0);
+            // self.usages[TimerEntry::RegenCandidates as usize] += 1;
         }
     }
 
@@ -564,57 +564,33 @@ impl Simulation {
         energy
     }
 
-    fn site_binding_energy(&self, site: &CandidateSite) -> f32 {
-        let type_c = site.type_id;
-        let rc = self.config.radius(type_c);
-        let pos = site.pos;
-        let query_r = rc + self.config.max_radius() + self.config.delta;
-        let config = &self.config;
-        let mut energy = 0.0f32;
-        self.particle_grid.query_iter(pos.x, pos.y, query_r, |neighbor| {
-            if config.has_patches() {
-                let r_vec = neighbor.pos - pos;
-                let r_contact = rc + neighbor.radius;
-                // Negate: patchy_pair_energy < 0 for attractive patches (eps < 0).
-                energy -= patchy_pair_energy(
-                    r_vec,
-                    r_contact,
-                    &config.particle_types[type_c].patches,
-                    site.orientation,
-                    &config.particle_types[neighbor.type_id].patches,
-                    neighbor.orientation,
-                    &config.patch_lut,
-                    config.patch_type_count,
-                    config.epsilon(type_c, neighbor.type_id),
-                    config.delta,
-                );
-            } else {
-                let contact = neighbor.radius + rc;
-                let d = neighbor.pos.distance(pos);
-                if d >= contact - config.delta && d <= contact + config.delta {
-                    energy += config.epsilon(type_c, neighbor.type_id);
-                }
-            }
-        });
-        energy
-    }
 
-    fn best_candidate_orientation(&self, pos: Vec2, type_c: usize) -> Vec2 {
+    /// Returns (best_orientation, binding_energy) for a candidate site in one grid query.
+    /// Replaces the former separate best_candidate_orientation + site_binding_energy calls.
+    fn candidate_orientation_and_energy(&self, pos: Vec2, type_c: usize) -> (Vec2, f32) {
         let config = &self.config;
-        if !config.has_patches() || config.particle_types[type_c].patches.is_empty() {
-            return Vec2::X;
-        }
-
         let rc = config.radius(type_c);
         let query_r = rc + config.max_radius() + config.delta;
         let nearby = self.particle_grid.query(pos.x, pos.y, query_r);
-        if nearby.is_empty() {
-            return Vec2::X;
+
+        if !config.has_patches() || config.particle_types[type_c].patches.is_empty() {
+            // Non-patchy: orientation irrelevant; compute scalar bond energy.
+            let mut energy = 0.0f32;
+            for nb in &nearby {
+                let contact = nb.radius + rc;
+                let d = nb.pos.distance(pos);
+                if d >= contact - config.delta && d <= contact + config.delta {
+                    energy += config.epsilon(type_c, nb.type_id);
+                }
+            }
+            return (Vec2::X, energy);
         }
 
-        // Build candidate orientations as unit vectors.
-        // For each neighbour, the ideal orientation that aligns patch toward it is:
-        //   phi_v rotated by -position_rad  =  phi_v * conj(position_cs)
+        if nearby.is_empty() {
+            return (Vec2::X, 0.0);
+        }
+
+        // Build candidate orientations: for each neighbour align each patch toward it.
         let mut orientation_candidates: Vec<Vec2> = vec![Vec2::X];
         for nb in &nearby {
             let diff = nb.pos - pos;
@@ -627,7 +603,6 @@ impl Simulation {
                     phi_v.x * cs.x + phi_v.y * cs.y,
                     phi_v.y * cs.x - phi_v.x * cs.y,
                 );
-                // Only add if not already close to an existing candidate (dot product ~ 1).
                 if !orientation_candidates.iter().any(|&u| u.dot(cand) > 1.0 - 1e-9) {
                     orientation_candidates.push(cand);
                 }
@@ -635,7 +610,7 @@ impl Simulation {
         }
 
         let mut best_orientation = orientation_candidates[0];
-        let mut best_energy = f32::INFINITY;
+        let mut best_energy = f32::INFINITY; // patchy_pair_energy < 0 for attractive
         for &orientation in &orientation_candidates {
             let mut energy = 0.0f32;
             for nb in &nearby {
@@ -660,14 +635,12 @@ impl Simulation {
             }
         }
 
-        best_orientation
+        (best_orientation, -best_energy) // negate: binding energy is positive for attractive
     }
 
-    fn add_candidate(&mut self, site: CandidateSite) {
+    fn add_candidate(&mut self, site: CandidateSite, binding_energy: f32) {
         let type_c = site.type_id;
         let pos = site.pos;
-        let binding_energy = self.site_binding_energy(&site);
-
         self.candidates.push(site);
         let idx = self.candidates.len() - 1;
         self.candidates_spatial.insert(idx, pos.x, pos.y);
@@ -680,6 +653,7 @@ impl Simulation {
     }
 
     fn regen_candidates_batch(&mut self, regions: &[(Vec2, f32)]) {
+        let t0 = rdtsc();
         if regions.is_empty() {
             return;
         }
@@ -788,7 +762,7 @@ impl Simulation {
                         if (b.pos.x, b.pos.y) <= (a_pos.x, a_pos.y) { continue; }
                         (b.pos, b.radius)
                     };
-
+                    
                     let r_ac = a_r + rc;
                     let r_bc = b_r + rc;
 
@@ -805,8 +779,8 @@ impl Simulation {
                             &self.regen_scratch.overlap_pos,
                             &self.regen_scratch.overlap_rad,
                         ) { continue; }
-                        let orientation = self.best_candidate_orientation(site_pos, type_c);
-                        self.add_candidate(CandidateSite { pos: site_pos, type_id: type_c, orientation });
+                        let (orientation, energy) = self.candidate_orientation_and_energy(site_pos, type_c);
+                        self.add_candidate(CandidateSite { pos: site_pos, type_id: type_c, orientation }, energy);
                     }
                 }
 
@@ -824,7 +798,7 @@ impl Simulation {
                     let blocked = self.regen_scratch.bonded_dirs.iter()
                         .any(|&bd| theta_v.dot(bd) > cos_excl);
                     if blocked { continue; }
-                    let site_pos = a_pos + Vec2::new(theta.cos(), theta.sin()) * r_contact;
+                    let site_pos = a_pos + theta_v * r_contact;
                     if site_has_overlap(site_pos, rc, delta,
                         &self.regen_scratch.overlap_idx,
                         &self.regen_scratch.overlap_pos,
@@ -837,20 +811,22 @@ impl Simulation {
                 if arc_len <= max_arc {
                     for ai in 0..arc_len {
                         let pos = self.regen_scratch.arc_candidates[ai];
-                        let orientation = self.best_candidate_orientation(pos, type_c);
-                        self.add_candidate(CandidateSite { pos, type_id: type_c, orientation });
+                        let (orientation, energy) = self.candidate_orientation_and_energy(pos, type_c);
+                        self.add_candidate(CandidateSite { pos, type_id: type_c, orientation }, energy);
                     }
                 } else {
                     let step = arc_len as f32 / max_arc as f32;
                     for i in 0..max_arc {
                         let idx = (i as f32 * step) as usize;
                         let pos = self.regen_scratch.arc_candidates[idx];
-                        let orientation = self.best_candidate_orientation(pos, type_c);
-                        self.add_candidate(CandidateSite { pos, type_id: type_c, orientation });
+                        let (orientation, energy) = self.candidate_orientation_and_energy(pos, type_c);
+                        self.add_candidate(CandidateSite { pos, type_id: type_c, orientation }, energy);
                     }
                 }
             }
         }
+        self.timers[TimerEntry::RegenCandidates as usize] += rdtsc().wrapping_sub(t0);
+        self.usages[TimerEntry::RegenCandidates as usize] += 1;
     }
 
     /// Rebuild the flat f32 particle buffer for the WASM export.

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Crystal Sim Editor</title>
+  <link rel="stylesheet" href="css/styles.css" />
+  <link rel="stylesheet" href="css/editor.css" />
+</head>
+<body>
+  <div id="editor-app">
+
+    <!-- ── Header ──────────────────────────────────────────────────────────── -->
+    <header id="editor-header">
+      <span class="editor-title">Crystal Sim Editor</span>
+      <div class="header-actions">
+        <button id="btn-load"   class="btn">Load Config</button>
+        <button id="btn-export" class="btn btn-primary">Export JSON</button>
+        <a href="index.html" class="btn btn-ghost">← Simulation</a>
+      </div>
+      <!-- Hidden file input for config loading -->
+      <input type="file" id="file-input" accept=".json" style="display:none" />
+    </header>
+
+    <!-- ── Three panels ────────────────────────────────────────────────────── -->
+    <div id="panels-row">
+
+      <!-- Panel 1: Patch palette + interactions -->
+      <div id="panel1" class="panel panel-patches">
+      </div>
+
+      <!-- Panel 2: Particle type designer -->
+      <div id="panel2" class="panel panel-particles">
+      </div>
+
+      <!-- Panel 3: Physics preview -->
+      <div id="panel3" class="panel panel-physics">
+      </div>
+
+    </div>
+
+    <!-- ── JSON preview (collapsible) ──────────────────────────────────────── -->
+    <div class="json-section collapsed">
+      <button id="json-toggle" class="btn json-toggle-btn">{ } JSON Preview</button>
+      <textarea id="json-preview" class="json-preview" readonly spellcheck="false"></textarea>
+    </div>
+
+  </div>
+
+  <script type="module" src="js/editor/main.js"></script>
+</body>
+</html>

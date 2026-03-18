@@ -246,7 +246,6 @@ pub fn patchy_force_torque(
             tau_j += eps * radial * g * sin_jb / sj2;
         }
     }
-
     (force, tau_i, tau_j)
 }
 

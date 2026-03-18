@@ -1,11 +1,14 @@
 mod candidates;
 pub mod config;
+pub mod editor_sim;
 pub mod forces;
 pub mod kmc;
 pub mod particle;
 mod rates;
 mod rng;
 mod spatial;
+
+pub use editor_sim::EditorSim;
 
 use kmc::Simulation;
 use config::SimConfig;
@@ -83,7 +86,7 @@ impl CrystalSim {
     pub fn candidate_buffer(&self) -> u32 {
         self.inner.candidate_buf_ptr() as u32
     }
-
+    
     /// Number of candidate sites currently tracked.
     pub fn candidate_count(&self) -> u32 {
         self.inner.candidate_count()
