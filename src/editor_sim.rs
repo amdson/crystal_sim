@@ -139,6 +139,8 @@ impl EditorSim {
         self.particles.clear();
         self.velocities.clear();
         self.ang_velocities.clear();
+        self.forces.clear();
+        self.torques.clear();
 
         for p in placements {
             let type_id = self.clamp_type(p.type_id);
@@ -152,6 +154,8 @@ impl EditorSim {
             });
             self.velocities.push(Vec2::ZERO);
             self.ang_velocities.push(0.0);
+            self.forces.push(Vec2::ZERO);
+            self.torques.push(0.0);
         }
 
         self.sync_buf();
@@ -179,6 +183,8 @@ impl EditorSim {
         });
         self.velocities.push(Vec2::ZERO);
         self.ang_velocities.push(0.0);
+        self.forces.push(Vec2::ZERO);
+        self.torques.push(0.0);
         self.sync_buf();
         idx
     }
@@ -190,6 +196,8 @@ impl EditorSim {
             self.particles.swap_remove(i);
             self.velocities.swap_remove(i);
             self.ang_velocities.swap_remove(i);
+            self.forces.swap_remove(i);
+            self.torques.swap_remove(i);
             self.sync_buf();
         }
     }

@@ -84,16 +84,18 @@ export function startDrag({
     if (e.pointerId !== pointerId) return;
     cleanup();
     onDrop?.(e.clientX, e.clientY);
-    // Delay clearing _active so the pointerup event can finish bubbling to
-    // document-level listeners (e.g. main.js drop handlers) before it goes null.
-    queueMicrotask(() => { _active = null; });
+    // Use setTimeout (not queueMicrotask) so _active stays set through the full
+    // event-bubbling chain. Chrome runs microtask checkpoints between individual
+    // event listeners, so queueMicrotask would clear _active before the
+    // document-level pointerup handler (main.js) gets a chance to read it.
+    setTimeout(() => { _active = null; }, 0);
   };
 
   const handleCancel = e => {
     if (e.pointerId !== pointerId) return;
     cleanup();
     onCancel?.();
-    queueMicrotask(() => { _active = null; });
+    setTimeout(() => { _active = null; }, 0);
   };
 
   function cleanup() {
