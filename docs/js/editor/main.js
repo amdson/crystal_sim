@@ -56,6 +56,15 @@ async function main() {
     downloadJson(buildConfigJson());
   });
 
+  // Wire simulate button — sends config to the simulator tab via localStorage + BroadcastChannel
+  const _simChannel = new BroadcastChannel('crystal_sim');
+  document.getElementById('btn-simulate').addEventListener('click', () => {
+    const cfg = buildConfigJson();
+    localStorage.setItem('crystal_editor_config', JSON.stringify(cfg));
+    _simChannel.postMessage({ type: 'load_config', config: cfg });
+    window.open('index.html', 'crystal_sim_window');
+  });
+
   // Wire load config button
   document.getElementById('btn-load').addEventListener('click', () => {
     document.getElementById('file-input').click();

@@ -133,9 +133,14 @@ export function loadConfig(json) {
     }
   }
 
-  // Build patchTypes array.
+  // Build patchTypes array, restoring colors from patch_types section if present.
+  const savedPatchColors = new Map((json.patch_types ?? []).map(p => [p.name, p.color]));
   patchNameOrder.forEach((name, idx) => {
-    state.patchTypes.push({ id: idx, name, color: patchColorFor(idx) });
+    state.patchTypes.push({
+      id: idx,
+      name,
+      color: savedPatchColors.get(name) ?? patchColorFor(idx),
+    });
   });
 
   // Build interactions map.

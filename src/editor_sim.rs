@@ -356,9 +356,13 @@ impl EditorSim {
                     .patches
                     .iter()
                     .map(|p| {
+                        let color = self.config.patch_colors
+                            .get(p.patch_type_id)
+                            .and_then(|c| c.as_deref())
+                            .unwrap_or("#ffffff");
                         format!(
-                            r##"{{"angle_rad":{:.6},"color":"#ffffff"}}"##,
-                            p.position_rad
+                            r##"{{"angle_rad":{:.6},"color":"{}"}}"##,
+                            p.position_rad, color
                         )
                     })
                     .collect();

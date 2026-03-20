@@ -7,6 +7,7 @@
 use glam::Vec2;
 
 use crate::config::{PatchDef, PatchLutEntry};
+use crate::math_utils::utils::exp3;
 
 /// Rotate `position_cs` by `orientation` — trig-free patch direction.
 /// Both arguments are unit vectors (orientation of particle, precomputed patch direction).
@@ -150,7 +151,7 @@ pub fn patchy_pair_energy(
             // g = exp(-(1-cos)/sigma^2); matches exp(-theta^2/(2*sigma^2)) for small theta.
             let si2 = int.sigma_i * int.sigma_i;
             let sj2 = int.sigma_j * int.sigma_j;
-            let g = ((cos_ia - 1.0) / si2).exp() * ((cos_jb - 1.0) / sj2).exp();
+            let g = exp3((cos_ia - 1.0) / si2) * exp3((cos_jb - 1.0) / sj2);
             energy += int.epsilon * radial * g;
         }
     }
@@ -227,7 +228,7 @@ pub fn patchy_force_torque(
             let si2 = int.sigma_i * int.sigma_i;
             let sj2 = int.sigma_j * int.sigma_j;
             // g = exp(-(1-cos)/sigma^2); matches exp(-theta^2/(2*sigma^2)) for small theta.
-            let g = ((cos_ia - 1.0) / si2).exp() * ((cos_jb - 1.0) / sj2).exp();
+            let g = exp3((cos_ia - 1.0) / si2) * exp3((cos_jb - 1.0) / sj2);
             let eps = int.epsilon;
 
             // Radial term: F_i = -dU/dr_i; dr/dr_i = -r_hat.
@@ -271,7 +272,7 @@ fn contact_bump_with_derivative(r: f32, r_contact: f32, r_cut: f32) -> (f32, f32
         return (0.0, 0.0);
     }
     let inv = 1.0 / (1.0 - x2);
-    let bump = (1.0 - inv).exp();
+    let bump = exp3(1.0 - inv);
     let d_bump_dr = bump * (-(2.0 * x) * inv * inv) / width;
     (bump, d_bump_dr)
 }

@@ -17,15 +17,7 @@ let typeMetadata = [];  // [{color, radius}, ...]
 export function initSim(wasmModule, config) {
   sim = new wasmModule.CrystalSim(JSON.stringify(config));
   wasmMemory = wasmModule.memory;
-  // Derive metadata from the config directly — no round-trip through WASM JSON.
-  typeMetadata = (config.particle_types || []).map(t => ({
-    color:   t.color,
-    radius:  t.radius,
-    patches: (t.patches || []).map(p => ({
-      angle_rad: p.position_deg * Math.PI / 180,
-      color: '#ffffff',
-    })),
-  }));
+  typeMetadata = JSON.parse(sim.type_metadata_json());
 }
 
 /** Advance the simulation by n KMC events. */
@@ -67,18 +59,12 @@ export function setChemicalPotential(typeId, mu) {
   if (sim) sim.set_chemical_potential(typeId, mu);
 }
 
-/** Number of candidate attachment sites. */
+/** Candidate sites are no longer tracked persistently; always returns 0. */
 export function getCandidateCount() {
-  return sim ? sim.candidate_count() : 0;
+  return 0;
 }
 
-/**
- * Zero-copy Float32Array view into the candidate buffer.
- * Layout: [x, y, type_id, rate]  per candidate (stride 4).
- */
+/** Candidate sites are no longer tracked persistently; always returns empty. */
 export function getCandidateBuffer() {
-  if (!sim || !wasmMemory) return new Float32Array(0);
-  const count = sim.candidate_count();
-  const ptr   = sim.candidate_buffer();
-  return new Float32Array(wasmMemory.buffer, ptr, count * 4);
+  return new Float32Array(0);
 }

@@ -3,6 +3,13 @@ use std::f32::consts::PI;
 use serde::Deserialize;
 use glam::Vec2;
 
+#[derive(Deserialize, Clone, Debug)]
+pub struct PatchTypeDef {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct PatchDef {
     /// Unique string tag identifying the patch type (e.g. "A", "B").
@@ -109,6 +116,9 @@ pub struct SimConfig {
     pub steps_per_frame: u32,
     #[serde(default = "default_relax_damping")]
     pub relax_damping: f32,
+    /// Optional patch type color definitions: [{name: "A", color: "#e84040"}, ...]
+    #[serde(default)]
+    pub patch_types: Vec<PatchTypeDef>,
     /// Patch-pair interaction definitions.
     #[serde(default)]
     pub patch_interactions: Vec<PatchInteraction>,
@@ -136,6 +146,9 @@ pub struct SimConfig {
     /// interactions where patch type i is on the i-side and type j on the j-side.
     #[serde(skip)]
     pub patch_lut: Vec<PatchLutEntry>,
+    /// Patch colors indexed by intern id (same order as patch_type_ids).
+    #[serde(skip)]
+    pub patch_colors: Vec<Option<String>>,
 }
 
 fn default_angles() -> u32 { 16 }
@@ -226,6 +239,15 @@ impl SimConfig {
                     cutoff: int.cutoff,
                     enabled: true,
                 };
+            }
+        }
+
+        // Build patch color table indexed by intern id.
+        self.patch_colors.clear();
+        self.patch_colors.resize(self.patch_type_count, None);
+        for ptype in &self.patch_types {
+            if let Some(&id) = patch_type_ids.get(&ptype.name) {
+                self.patch_colors[id] = ptype.color.clone();
             }
         }
 

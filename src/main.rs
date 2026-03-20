@@ -319,9 +319,14 @@ impl eframe::App for CrystalApp {
                         let p2 = Pos2::new(c.x + ux * patch_half + vx * patch_half, c.y + uy * patch_half + vy * patch_half);
                         let p3 = Pos2::new(c.x - ux * patch_half + vx * patch_half, c.y - uy * patch_half + vy * patch_half);
 
+                        let patch_color = self.sim.config.patch_colors
+                            .get(patch.patch_type_id)
+                            .and_then(|c| c.as_deref())
+                            .map(parse_color)
+                            .unwrap_or(Color32::from_rgb(245, 245, 245));
                         painter.add(egui::Shape::convex_polygon(
                             vec![p0, p1, p2, p3],
-                            Color32::from_rgb(245, 245, 245),
+                            patch_color,
                             Stroke::new(0.8, Color32::from_rgba_unmultiplied(20, 20, 20, 180)),
                         ));
                     }

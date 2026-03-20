@@ -8,7 +8,6 @@ use crate::forces::{patchy_force_torque, patchy_pair_energy};
 use crate::particle::Particle;
 use crate::rng::Rng;
 use crate::spatial::ParticleGrid;
-use crate::math_utils::exp3; 
 
 /// Read the CPU timestamp counter — ~4 cycles, no syscall.
 #[inline(always)]
@@ -807,7 +806,11 @@ impl Simulation {
             .iter()
             .map(|t| {
                 let patches: Vec<String> = t.patches.iter().map(|p| {
-                    format!(r##"{{"angle_rad":{:.6},"color":"#ffffff"}}"##, p.position_rad)
+                    let color = self.config.patch_colors
+                        .get(p.patch_type_id)
+                        .and_then(|c| c.as_deref())
+                        .unwrap_or("#ffffff");
+                    format!(r##"{{"angle_rad":{:.6},"color":"{}"}}"##, p.position_rad, color)
                 }).collect();
                 format!(
                     r#"{{"color":"{}","radius":{},"patches":[{}]}}"#,

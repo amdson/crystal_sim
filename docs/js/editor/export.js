@@ -26,6 +26,9 @@ export function buildConfigJson() {
     }),
   }));
 
+  // Patch type color definitions
+  const patch_types = patchTypes.map(pt => ({ name: pt.name, color: pt.color }));
+
   // Epsilon matrix (NxN, filled with 0 — patch_interactions carries the real params)
   const n = particleTypes.length;
   const epsilon = Array.from({ length: n }, () => Array(n).fill(0));
@@ -59,6 +62,7 @@ export function buildConfigJson() {
 
   return {
     particle_types,
+    patch_types,
     epsilon,
     delta: physics.delta,
     temperature: physics.temperature,

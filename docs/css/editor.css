@@ -65,6 +65,39 @@ body {
 
 /* ── Panel titles ──────────────────────────────────────────────────────────── */
 
+.panel-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #252635;
+  flex-shrink: 0;
+}
+
+.panel-title-row .panel-title {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: none;
+  flex: 1;
+}
+
+.snap-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: #8888aa;
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.snap-toggle input[type="checkbox"] {
+  cursor: pointer;
+  accent-color: #7a7aee;
+}
+
 .panel-title {
   font-size: 13px;
   font-weight: 600;

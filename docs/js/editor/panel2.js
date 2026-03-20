@@ -15,9 +15,16 @@ import {
 import { startDrag, isOverElement } from './drag.js';
 
 const CARD_CANVAS_SIZE = 120;
+const SNAP_DEGREES = 15;
 
 let _container      = null;
 let _onConfigChange = null;
+let _snapToAngle    = false;
+
+function snapDeg(deg) {
+  if (!_snapToAngle) return deg;
+  return Math.round(deg / SNAP_DEGREES) * SNAP_DEGREES;
+}
 
 export function initPanel2(container, onConfigChange) {
   _container      = container;
@@ -35,10 +42,26 @@ function render() {
   if (!_container) return;
   _container.innerHTML = '';
 
+  const titleRow = document.createElement('div');
+  titleRow.className = 'panel-title-row';
+
   const title = document.createElement('h2');
   title.className = 'panel-title';
   title.textContent = 'Particles';
-  _container.appendChild(title);
+  titleRow.appendChild(title);
+
+  const snapLabel = document.createElement('label');
+  snapLabel.className = 'snap-toggle';
+  snapLabel.title = 'Snap patch angles to multiples of 15°';
+  const snapCb = document.createElement('input');
+  snapCb.type = 'checkbox';
+  snapCb.checked = _snapToAngle;
+  snapCb.addEventListener('change', () => { _snapToAngle = snapCb.checked; });
+  snapLabel.appendChild(snapCb);
+  snapLabel.appendChild(document.createTextNode(' Snap 15°'));
+  titleRow.appendChild(snapLabel);
+
+  _container.appendChild(titleRow);
 
   const addBtn = document.createElement('button');
   addBtn.className = 'btn btn-add';
@@ -261,7 +284,7 @@ function startPatchDrag(canvas, typeIndex, patchIdx, patchType, pointerId, card)
         const rect = canvas.getBoundingClientRect();
         const mx = clientX - rect.left;
         const my = clientY - rect.top;
-        const deg = pixelToAngleDeg(mx, my, canvas.width, canvas.height);
+        const deg = snapDeg(pixelToAngleDeg(mx, my, canvas.width, canvas.height));
         drawCardCanvas(canvas, typeIndex, {
           draggingPatchIdx: patchIdx,
           previewAngleDeg: deg,
@@ -280,7 +303,7 @@ function startPatchDrag(canvas, typeIndex, patchIdx, patchType, pointerId, card)
         const mx = clientX - rect.left;
         const my = clientY - rect.top;
         pt.patches[patchIdx].position_deg =
-          pixelToAngleDeg(mx, my, canvas.width, canvas.height);
+          snapDeg(pixelToAngleDeg(mx, my, canvas.width, canvas.height));
       } else {
         // Dragged off — delete patch
         pt.patches.splice(patchIdx, 1);
@@ -310,7 +333,7 @@ export function receivePatchDrop(typeIndex, patchTypeId, clientX, clientY) {
   const rect   = canvas.getBoundingClientRect();
   const mx     = clientX - rect.left;
   const my     = clientY - rect.top;
-  const deg    = pixelToAngleDeg(mx, my, canvas.width, canvas.height);
+  const deg    = snapDeg(pixelToAngleDeg(mx, my, canvas.width, canvas.height));
 
   state.particleTypes[typeIndex].patches.push({ patchTypeId, position_deg: deg });
   drawCardCanvas(canvas, typeIndex);
@@ -331,7 +354,7 @@ export function updatePatchDropPreview(clientX, clientY, patchColor) {
       const rect = canvas.getBoundingClientRect();
       const mx = clientX - rect.left;
       const my = clientY - rect.top;
-      const deg = pixelToAngleDeg(mx, my, canvas.width, canvas.height);
+      const deg = snapDeg(pixelToAngleDeg(mx, my, canvas.width, canvas.height));
       drawCardCanvas(canvas, i, { previewAngleDeg: deg, previewPatchColor: patchColor });
     } else {
       drawCardCanvas(canvas, i);

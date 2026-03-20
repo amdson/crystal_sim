@@ -20,13 +20,40 @@ let wasmModule = null;
 
 // ── Startup ───────────────────────────────────────────────────────────────
 async function start() {
-  // Load config and WASM in parallel.
-  const [config, wasm] = await Promise.all([
+  // Load WASM and default config in parallel.
+  const [defaultConfig, wasm] = await Promise.all([
     fetch('/config/checkerboard.json').then(r => r.json()),
     init(),
   ]);
   wasmModule = wasm;
+
+  // Prefer a config sent from the editor over the default.
+  let config = defaultConfig;
+  const editorJson = localStorage.getItem('crystal_editor_config');
+  if (editorJson) {
+    try {
+      config = JSON.parse(editorJson);
+      setEditorBadge(true);
+    } catch (e) { /* ignore malformed */ }
+  }
+
   boot(config);
+
+  // Live-reload when the editor pushes a new config.
+  const channel = new BroadcastChannel('crystal_sim');
+  channel.addEventListener('message', e => {
+    if (e.data?.type === 'load_config') {
+      localStorage.setItem('crystal_editor_config', JSON.stringify(e.data.config));
+      setEditorBadge(true);
+      boot(e.data.config);
+    }
+  });
+}
+
+function setEditorBadge(active) {
+  let badge = document.getElementById('editorBadge');
+  if (!badge) return;
+  badge.style.display = active ? 'inline' : 'none';
 }
 
 export function loadConfig(config) {
