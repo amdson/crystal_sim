@@ -24,7 +24,8 @@ pub struct PatchDef {
 pub struct PatchInteraction {
     /// [patch_type_0, patch_type_1] - order determines which sigma applies to which side.
     pub types: [String; 2],
-    /// LJ well depth for this patch pair (positive = attractive).
+    /// Patch interaction strength. Negative = attractive, positive = repulsive.
+    /// Matches the scalar epsilon convention: energy = epsilon * bump * g.
     pub epsilon: f32,
     /// Gaussian half-width in degrees for each side: [sigma_0_deg, sigma_1_deg].
     pub angular_width_deg: [f32; 2],

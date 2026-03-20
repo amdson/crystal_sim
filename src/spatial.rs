@@ -75,29 +75,33 @@ impl SpatialHash {
 /// Per-cell struct-of-arrays.  All Vecs inside a `Cell` are kept the same
 /// length; `swap_remove` on one must be mirrored across all others.
 pub struct Cell {
-    pub particles:       Vec<Particle>,
-    pub rates:           Vec<f64>,
-    pub aggr_rate:       f64,
-    pub velocities:      Vec<Vec2>,
-    pub new_pos:         Vec<Vec2>,
-    pub ang_velocities:  Vec<f32>,
-    pub new_orientation: Vec<Vec2>,
-    pub is_active:       Vec<bool>,
-    pub is_frozen:       Vec<bool>,
+    pub particles:        Vec<Particle>,
+    pub rates:            Vec<f64>,
+    pub aggr_rate:        f64,
+    pub attach_rates:     Vec<f64>,   // per-particle attachment rate sum
+    pub aggr_attach_rate: f64,        // sum of attach_rates for this cell
+    pub velocities:       Vec<Vec2>,
+    pub new_pos:          Vec<Vec2>,
+    pub ang_velocities:   Vec<f32>,
+    pub new_orientation:  Vec<Vec2>,
+    pub is_active:        Vec<bool>,
+    pub is_frozen:        Vec<bool>,
 }
 
 impl Cell {
     fn new() -> Self {
         Self {
-            particles:       Vec::new(),
-            rates:           Vec::new(),
-            aggr_rate:       0.0,
-            velocities:      Vec::new(),
-            new_pos:         Vec::new(),
-            ang_velocities:  Vec::new(),
-            new_orientation: Vec::new(),
-            is_active:       Vec::new(),
-            is_frozen:       Vec::new(),
+            particles:        Vec::new(),
+            rates:            Vec::new(),
+            aggr_rate:        0.0,
+            attach_rates:     Vec::new(),
+            aggr_attach_rate: 0.0,
+            velocities:       Vec::new(),
+            new_pos:          Vec::new(),
+            ang_velocities:   Vec::new(),
+            new_orientation:  Vec::new(),
+            is_active:        Vec::new(),
+            is_frozen:        Vec::new(),
         }
     }
 
@@ -107,6 +111,7 @@ impl Cell {
         self.aggr_rate += rate;
         self.particles.push(p);
         self.rates.push(rate);
+        self.attach_rates.push(0.0); // caller must call update_attach_rate
         self.velocities.push(Vec2::ZERO);
         self.new_pos.push(pos);
         self.ang_velocities.push(0.0);
@@ -116,9 +121,11 @@ impl Cell {
     }
 
     fn swap_remove(&mut self, ind: usize) -> (Particle, f64) {
-        let p    = self.particles.swap_remove(ind);
-        let rate = self.rates.swap_remove(ind);
-        self.aggr_rate -= rate;
+        let p           = self.particles.swap_remove(ind);
+        let rate        = self.rates.swap_remove(ind);
+        let attach_rate = self.attach_rates.swap_remove(ind);
+        self.aggr_rate        -= rate;
+        self.aggr_attach_rate -= attach_rate;
         self.velocities.swap_remove(ind);
         self.new_pos.swap_remove(ind);
         self.ang_velocities.swap_remove(ind);
@@ -242,6 +249,31 @@ impl ParticleGrid {
         self.cells.iter().map(|c| c.aggr_rate).sum()
     }
 
+    pub fn total_attach_rate(&self) -> f64 {
+        self.cells.iter().map(|c| c.aggr_attach_rate).sum()
+    }
+
+    /// Sample a particle proportional to its attachment rate sum.
+    /// Returns `(cell_idx, particle_idx)`.
+    pub fn sample_attach_rate(&self, u: f64) -> Option<(usize, usize)> {
+        let total: f64 = self.cells.iter().map(|c| c.aggr_attach_rate).sum();
+        if total == 0.0 { return None; }
+        let mut threshold = u * total;
+        for (idx, cell) in self.cells.iter().enumerate() {
+            if threshold < cell.aggr_attach_rate {
+                for (i, &rate) in cell.attach_rates.iter().enumerate() {
+                    if threshold < rate {
+                        return Some((idx, i));
+                    }
+                    threshold -= rate;
+                }
+            } else {
+                threshold -= cell.aggr_attach_rate;
+            }
+        }
+        None
+    }
+
     pub fn set_rate(&mut self, pos: Vec2, new_rate: f64) {
         let key = self.cell_key(pos.x, pos.y);
         if let Some(&idx) = self.cell_map.get(&key) {
@@ -339,7 +371,7 @@ impl ParticleGrid {
 
             cross_inds.sort_unstable_by(|a, b| b.cmp(a));
             for ind in cross_inds {
-                let (new_pos, new_ori, vel, omega, is_act, is_frz, rate) = {
+                let (new_pos, new_ori, vel, omega, is_act, is_frz, rate, attach_rate) = {
                     let c = &self.cells[cell_idx];
                     (
                         c.new_pos[ind],
@@ -349,6 +381,7 @@ impl ParticleGrid {
                         c.is_active[ind],
                         c.is_frozen[ind],
                         c.rates[ind],
+                        c.attach_rates[ind],
                     )
                 };
                 let (mut p, _) = self.swap_remove(cell_idx, ind);
@@ -363,6 +396,9 @@ impl ParticleGrid {
                 tc.ang_velocities[last] = omega;
                 tc.is_active[last]      = is_act;
                 tc.is_frozen[last]      = is_frz;
+                // Restore attach_rate that was zeroed by insert/push.
+                tc.aggr_attach_rate += attach_rate;
+                tc.attach_rates[last] = attach_rate;
                 moved_to.insert(target_key);
             }
         }

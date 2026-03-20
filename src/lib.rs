@@ -81,14 +81,4 @@ impl CrystalSim {
         self.inner.type_metadata_json()
     }
 
-    /// Byte offset into WASM memory of the candidate buffer.
-    /// Layout per candidate: [x, y, type_id, rate]  (f32, stride 4)
-    pub fn candidate_buffer(&self) -> u32 {
-        self.inner.candidate_buf_ptr() as u32
-    }
-    
-    /// Number of candidate sites currently tracked.
-    pub fn candidate_count(&self) -> u32 {
-        self.inner.candidate_count()
-    }
 }

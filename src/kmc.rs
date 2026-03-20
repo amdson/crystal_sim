@@ -1,14 +1,14 @@
 use std::collections::HashSet;
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::PI;
 use glam::Vec2;
 
-use crate::candidates::{CandidateSite, circle_intersections, site_has_overlap};
+use crate::candidates::CandidateSite;
 use crate::config::SimConfig;
 use crate::forces::{patchy_force_torque, patchy_pair_energy};
 use crate::particle::Particle;
-use crate::rates::RateCatalog;
 use crate::rng::Rng;
-use crate::spatial::{ParticleGrid, SpatialHash};
+use crate::spatial::ParticleGrid;
+use crate::math_utils::exp3; 
 
 /// Read the CPU timestamp counter — ~4 cycles, no syscall.
 #[inline(always)]
@@ -42,12 +42,11 @@ enum TimerEntry {
     Detach,
     Rebuild,
     Relax,
-    RegenCandidates,
     Count,
 }
 
 static ENUM_STR: [&str; TimerEntry::Count as usize] = [
-    "Select", "Attach", "Detach", "Rebuild", "Relax", "RegenCandidates",
+    "Select", "Attach", "Detach", "Rebuild", "Relax",
 ];
 
 #[derive(Clone)]
@@ -58,29 +57,9 @@ struct TestParticleState {
     frozen: bool,
 }
 
-/// Long-lived scratch buffers for `regen_candidates_batch`.
-/// Kept between calls so that `clear()` reuses allocated capacity.
-#[derive(Default)]
-struct RegenScratch {
-    to_delete:        Vec<usize>,
-    particle_buf:     Vec<Particle>,
-    focal_particles:  Vec<Particle>,
-    overlap_particles: Vec<Particle>,
-    overlap_pos:      Vec<Vec2>,
-    overlap_rad:      Vec<f32>,
-    overlap_idx:      Vec<usize>,
-    bonded_dirs:      Vec<Vec2>,
-    arc_candidates:   Vec<Vec2>,
-}
-
 pub struct Simulation {
     /// Particles stored directly in the spatial grid; indexed by slot.
     pub particle_grid: ParticleGrid,
-
-    /// candidates[type_id] = current valid attachment sites for that type
-    pub candidates: Vec<CandidateSite>,
-    pub candidates_spatial: SpatialHash,
-    pub attach_rates: RateCatalog, // indexed by candidate index
 
     pub static_friction: f32,
 
@@ -93,11 +72,7 @@ pub struct Simulation {
     pub usages: Vec<u64>,
     cpu_ghz: f64,
 
-    /// Reusable buffer for spatial hash queries (avoids per-query allocation).
-    query_buf: Vec<usize>,
     particle_buf: Vec<f32>, // Flat buffer of (x, y, type_id, radius, orientation) for WASM export.
-    candidate_buf: Vec<f32>, // Flat buffer of (x, y, type_id, rate) for debug overlay.
-    regen_scratch: RegenScratch,
 
     /// Deterministic test-mode state (only used when `config.testing_mode` is true).
     test_particles: Vec<TestParticleState>,
@@ -106,26 +81,21 @@ pub struct Simulation {
 
 /*
 Simulation steps
-- Select candidate (add particle t at x, y or / remove particle i)
+- Select parent particle proportional to attach_rate_sum, or select particle to detach.
 - If attach:
-    - Add particle
-    - Run relaxation (Nx steps of gradient descent in neighborhood)
-    - Replace influenced candidates
-- If remove:
-    - Remove particle
-    - Replace influenced candidates
+    - Generate candidates on-demand for parent particle, sample one proportional to rate.
+    - Add particle, run relaxation, update neighbor attach/detach rates.
+- If detach:
+    - Remove particle, update neighbor attach/detach rates.
 */
 
 impl Simulation {
     pub fn new(mut config: SimConfig) -> Self {
         config.init_cache();
-        let cell_size = config.max_cutoff().max(0.1)*1.1; //Large cell size
+        let cell_size = config.max_cutoff().max(0.1)*1.1;
 
         let mut sim = Self {
             particle_grid: ParticleGrid::new(cell_size),
-            candidates: Vec::new(),
-            candidates_spatial: SpatialHash::new(cell_size),
-            attach_rates: RateCatalog::new(),
             static_friction: config.static_friction,
             time: 0.0,
             rng: Rng::new(config.seed),
@@ -133,10 +103,7 @@ impl Simulation {
             timers: vec![0u64; TimerEntry::Count as usize],
             usages: vec![0u64; TimerEntry::Count as usize],
             cpu_ghz: calibrate_tsc_ghz(),
-            query_buf: Vec::new(),
             particle_buf: Vec::new(),
-            candidate_buf: Vec::new(),
-            regen_scratch: RegenScratch::default(),
             test_particles: Vec::new(),
             test_step_counter: 0,
         };
@@ -160,10 +127,14 @@ impl Simulation {
             if sim.config.n_types() >= 1 {
                 let r0 = sim.config.radius(0);
                 sim.add_particle_raw(Particle::new(0.0, 0.0, 0, r0, Vec2::X));
+                // Compute initial attach rate for the seed particle.
+                let key = sim.particle_grid.cell_key(0.0, 0.0);
+                if let Some(&cell_idx) = sim.particle_grid.cell_map.get(&key) {
+                    if !sim.particle_grid.cells[cell_idx].particles.is_empty() {
+                        sim.update_attach_rate(cell_idx, 0);
+                    }
+                }
             }
-
-            let regen_r = sim.config.max_cutoff() * 4.0;
-            sim.regen_candidates_near(Vec2::ZERO, regen_r);
         }
         sim
     }
@@ -179,7 +150,7 @@ impl Simulation {
 
         for _ in 0..n {
             let t0_sel = rdtsc();
-            let attach_total = self.attach_rates.total();
+            let attach_total = self.particle_grid.total_attach_rate();
             let detach_total = self.particle_grid.total_rate();
             let r_total = attach_total + detach_total;
             if r_total <= 0.0 {
@@ -193,14 +164,16 @@ impl Simulation {
 
             if u1 < attach_total / r_total {
                 let attach_u = u1 * r_total / attach_total;
-                let candidate_ind = self.attach_rates.select(attach_u);
+                let result = self.particle_grid.sample_attach_rate(attach_u);
                 self.timers[TimerEntry::Select as usize] += rdtsc().wrapping_sub(t0_sel);
                 self.usages[TimerEntry::Select as usize] += 1;
 
-                let t0 = rdtsc();
-                self.attach(candidate_ind);
-                self.timers[TimerEntry::Attach as usize] += rdtsc().wrapping_sub(t0);
-                self.usages[TimerEntry::Attach as usize] += 1;
+                if let Some((cell, idx)) = result {
+                    let t0 = rdtsc();
+                    self.attach_from_particle(cell, idx);
+                    self.timers[TimerEntry::Attach as usize] += rdtsc().wrapping_sub(t0);
+                    self.usages[TimerEntry::Attach as usize] += 1;
+                }
             } else {
                 let detach_u = (u1 - attach_total / r_total) * r_total / detach_total;
                 self.timers[TimerEntry::Select as usize] += rdtsc().wrapping_sub(t0_sel);
@@ -215,7 +188,6 @@ impl Simulation {
 
         let t0 = rdtsc();
         self.rebuild_particle_buf();
-        self.rebuild_candidate_buf();
         self.timers[TimerEntry::Rebuild as usize] += rdtsc().wrapping_sub(t0);
         self.usages[TimerEntry::Rebuild as usize] += 1;
 
@@ -273,9 +245,6 @@ impl Simulation {
     fn sync_testing_particles_to_grid(&mut self) {
         let cell_size = self.particle_grid.cell_size;
         self.particle_grid = ParticleGrid::new(cell_size);
-        self.candidates.clear();
-        self.candidates_spatial = SpatialHash::new(cell_size);
-        self.attach_rates = RateCatalog::new();
 
         for s in &self.test_particles {
             self.particle_grid.insert(s.particle.clone(), 0.0);
@@ -411,34 +380,37 @@ impl Simulation {
         }
     }
 
-    fn del_candidate(&mut self, site_idx: usize) {
-        if site_idx >= self.candidates.len() {
-            return;
-        }
-        let site = &self.candidates[site_idx];
-        self.candidates_spatial.remove(site_idx, site.pos.x, site.pos.y);
-        self.candidates.swap_remove(site_idx);
-        self.attach_rates.swap_remove_rate(site_idx);
-
-        if site_idx < self.candidates.len() {
-            let moved_site = &self.candidates[site_idx];
-            self.candidates_spatial.remove(self.candidates.len(), moved_site.pos.x, moved_site.pos.y);
-            self.candidates_spatial.insert(site_idx, moved_site.pos.x, moved_site.pos.y);
-        }
-    }
-
-    fn del_candidates_batch(&mut self, mut indices: Vec<usize>) {
-        indices.sort_unstable_by(|a, b| b.cmp(a));
-        indices.dedup();
-        for site_idx in indices {
-            self.del_candidate(site_idx);
-        }
-    }
-
     // ── Attach ───────────────────────────────────────────────────────────────
 
-    fn attach(&mut self, candidate_ind: usize) {
-        let site = self.candidates[candidate_ind].clone();
+    /// Select and attach a particle based on a parent particle's patch candidates.
+    fn attach_from_particle(&mut self, cell: usize, idx: usize) {
+        let candidates = self.generate_candidates_for_particle(cell, idx);
+        if candidates.is_empty() {
+            // Rate was stale; zero it out so we don't keep sampling this particle.
+            self.particle_grid.cells[cell].aggr_attach_rate -=
+                self.particle_grid.cells[cell].attach_rates[idx];
+            self.particle_grid.cells[cell].attach_rates[idx] = 0.0;
+            return;
+        }
+
+        // Weighted sample from candidates proportional to rate.
+        let total: f64 = candidates.iter().map(|(_, r)| r).sum();
+        let u = self.rng.next_f64() * total;
+        let mut accum = 0.0f64;
+        let mut chosen = candidates[0].0.clone();
+        for (site, rate) in &candidates {
+            accum += rate;
+            if u < accum {
+                chosen = site.clone();
+                break;
+            }
+        }
+
+        self.attach_inner(chosen);
+    }
+
+    /// Place a particle at `site`, optionally relax, then update neighbor rates.
+    fn attach_inner(&mut self, site: CandidateSite) {
         let type_c = site.type_id;
         let rc = self.config.radius(type_c);
         let pos = site.pos;
@@ -447,16 +419,13 @@ impl Simulation {
         let delta = self.config.delta;
         let mut has_overlap = false;
         self.particle_grid.query_iter(pos.x, pos.y, query_r, |p| {
-            if has_overlap {
-                return;
-            }
+            if has_overlap { return; }
             let overlap_dist = rc + p.radius - delta;
             if overlap_dist > 0.0 && pos.distance_squared(p.pos) < overlap_dist * overlap_dist {
                 has_overlap = true;
             }
         });
         if has_overlap {
-            self.del_candidate(candidate_ind);
             return;
         }
 
@@ -474,11 +443,7 @@ impl Simulation {
             for nb in &nbs {
                 self.update_detach_rate(nb);
             }
-            let regen_r = (self.config.max_cutoff() + rc) * 2.0;
-            // let t0 = rdtsc();
-            self.regen_candidates_near(pos, regen_r);
-            // self.timers[TimerEntry::RegenCandidates as usize] += rdtsc().wrapping_sub(t0);
-            // self.usages[TimerEntry::RegenCandidates as usize] += 1;
+            self.update_neighbors_attach_rates(pos);
         }
     }
 
@@ -502,18 +467,14 @@ impl Simulation {
             self.update_detach_rate(nb);
         }
 
-        let regen_r = self.config.max_cutoff() * 2.0;
-        let t0 = rdtsc();
-        self.regen_candidates_near(pos, regen_r);
-        self.timers[TimerEntry::RegenCandidates as usize] += rdtsc().wrapping_sub(t0);
-        self.usages[TimerEntry::RegenCandidates as usize] += 1;
+        self.update_neighbors_attach_rates(pos);
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
-    /// Push a particle into the data structures without updating rates/candidates.
+    /// Push a particle into the data structures without updating rates.
     fn add_particle_raw(&mut self, p: Particle) {
-        self.particle_grid.insert(p, 0.0); // placeholder rate; caller must call update_detach_rate
+        self.particle_grid.insert(p, 0.0); // placeholder rate; caller must update
     }
 
     /// Compute E_bind for `p` and refresh its detachment rate in the grid.
@@ -543,8 +504,6 @@ impl Simulation {
             if config.has_patches() {
                 let r_vec = neighbor.pos - p.pos;
                 let r_contact = p.radius + neighbor.radius;
-                // patchy_pair_energy returns eps * bump * g, which is negative for
-                // attractive patches (eps < 0). Negate so binding_energy > 0 when bound.
                 energy -= patchy_pair_energy(
                     r_vec,
                     r_contact,
@@ -564,303 +523,237 @@ impl Simulation {
         energy
     }
 
-
-    /// Returns (best_orientation, binding_energy) for a candidate site in one grid query.
-    /// Replaces the former separate best_candidate_orientation + site_binding_energy calls.
-    fn candidate_orientation_and_energy(&self, pos: Vec2, type_c: usize) -> (Vec2, f32) {
+    /// Energy of a candidate particle of type `type_c` placed at `pos` with a
+    /// fixed `orientation`, summed over all nearby placed particles.
+    /// Returns a negative value when the net interaction is attractive.
+    fn site_energy_for_orientation(&self, pos: Vec2, type_c: usize, orientation: Vec2) -> f32 {
         let config = &self.config;
         let rc = config.radius(type_c);
         let query_r = rc + config.max_radius() + config.delta;
         let nearby = self.particle_grid.query(pos.x, pos.y, query_r);
-
-        if !config.has_patches() || config.particle_types[type_c].patches.is_empty() {
-            // Non-patchy: orientation irrelevant; compute scalar bond energy.
-            let mut energy = 0.0f32;
-            for nb in &nearby {
-                let contact = nb.radius + rc;
-                let d = nb.pos.distance(pos);
-                if d >= contact - config.delta && d <= contact + config.delta {
-                    energy += config.epsilon(type_c, nb.type_id);
-                }
-            }
-            return (Vec2::X, energy);
-        }
-
-        if nearby.is_empty() {
-            return (Vec2::X, 0.0);
-        }
-
-        // Build candidate orientations: for each neighbour align each patch toward it.
-        let mut orientation_candidates: Vec<Vec2> = vec![Vec2::X];
+        let mut energy = 0.0f32;
         for nb in &nearby {
-            let diff = nb.pos - pos;
-            if diff.length_squared() < 1e-24 { continue; }
-            let phi_v = diff.normalize();
-            for patch in &config.particle_types[type_c].patches {
-                let cs = patch.position_cs;
-                // rotate phi_v by -position_rad: phi_v * conj(cs)
-                let cand = Vec2::new(
-                    phi_v.x * cs.x + phi_v.y * cs.y,
-                    phi_v.y * cs.x - phi_v.x * cs.y,
-                );
-                if !orientation_candidates.iter().any(|&u| u.dot(cand) > 1.0 - 1e-9) {
-                    orientation_candidates.push(cand);
-                }
-            }
-        }
-
-        let mut best_orientation = orientation_candidates[0];
-        let mut best_energy = f32::INFINITY; // patchy_pair_energy < 0 for attractive
-        for &orientation in &orientation_candidates {
-            let mut energy = 0.0f32;
-            for nb in &nearby {
-                let r_vec = nb.pos - pos;
-                let r_contact = rc + nb.radius;
-                energy += patchy_pair_energy(
-                    r_vec,
-                    r_contact,
-                    &config.particle_types[type_c].patches,
-                    orientation,
-                    &config.particle_types[nb.type_id].patches,
-                    nb.orientation,
-                    &config.patch_lut,
-                    config.patch_type_count,
-                    config.epsilon(type_c, nb.type_id),
-                    config.delta,
-                );
-            }
-            if energy < best_energy {
-                best_energy = energy;
-                best_orientation = orientation;
-            }
-        }
-
-        (best_orientation, -best_energy) // negate: binding energy is positive for attractive
-    }
-
-    fn add_candidate(&mut self, site: CandidateSite, binding_energy: f32) {
-        let type_c = site.type_id;
-        let pos = site.pos;
-        self.candidates.push(site);
-        let idx = self.candidates.len() - 1;
-        self.candidates_spatial.insert(idx, pos.x, pos.y);
-        let rate = self.config.attach_rate(type_c, binding_energy);
-        self.attach_rates.add_rate(rate);
-    }
-
-    fn regen_candidates_near(&mut self, center: Vec2, radius: f32) {
-        self.regen_candidates_batch(&[(center, radius)]);
-    }
-
-    fn regen_candidates_batch(&mut self, regions: &[(Vec2, f32)]) {
-        let t0 = rdtsc();
-        if regions.is_empty() {
-            return;
-        }
-
-        let s = &mut self.regen_scratch;
-
-        // ── 1. Batch-delete stale candidates across all regions ───────────
-        s.to_delete.clear();
-        for &(center, radius) in regions {
-            let r_sq = radius * radius;
-            self.candidates_spatial.query_into(
-                center.x, center.y,
-                radius + self.config.max_cutoff(),
-                &mut self.query_buf,
+            let r_vec = nb.pos - pos;
+            let r_contact = rc + nb.radius;
+            energy += patchy_pair_energy(
+                r_vec, r_contact,
+                &config.particle_types[type_c].patches, orientation,
+                &config.particle_types[nb.type_id].patches, nb.orientation,
+                &config.patch_lut, config.patch_type_count,
+                config.epsilon(type_c, nb.type_id), config.delta,
             );
-            for &site_idx in &self.query_buf {
-                if site_idx < self.candidates.len()
-                    && self.candidates[site_idx].pos.distance_squared(center) < r_sq
-                {
-                    s.to_delete.push(site_idx);
-                }
-            }
         }
-        s.to_delete.sort_unstable();
-        s.to_delete.dedup();
-        // del_candidates_batch needs ownership; swap out to avoid holding &mut s and &mut self.
-        let to_delete = std::mem::take(&mut self.regen_scratch.to_delete);
-        self.del_candidates_batch(to_delete);
-        // Reclaim the (now-empty) vec back into scratch so capacity is retained.
-        // del_candidates_batch consumed and dropped it; re-initialise.
-        // (Capacity is lost here but to_delete is typically small — acceptable.)
+        energy
+    }
 
-        let s = &mut self.regen_scratch;
+    /// Compute total attachment rate attributable to particle at (cell, idx).
+    /// For each patch P_A, for each type C, find the best matching patch on C
+    /// and accumulate attach_rate if the interaction is attractive.
+    fn compute_attach_rate_sum(&self, cell: usize, idx: usize) -> f64 {
+        let (a_pos, a_r, a_type, a_ori) = {
+            let p = &self.particle_grid.cells[cell].particles[idx];
+            (p.pos, p.radius, p.type_id, p.orientation)
+        };
 
-        // ── 2. Build merged focal set (particles near any region) ─────────
-        s.particle_buf.clear();
-        s.focal_particles.clear();
-        for &(center, radius) in regions {
-            let search_r = radius + self.config.max_cutoff() * 2.0;
-            self.particle_grid.query_into(center.x, center.y, search_r, &mut s.particle_buf);
-            s.focal_particles.extend_from_slice(&s.particle_buf);
-        }
-        s.focal_particles.sort_unstable_by(|a, b| {
-            a.pos.x.total_cmp(&b.pos.x).then(a.pos.y.total_cmp(&b.pos.y))
-        });
-        s.focal_particles.dedup_by(|a, b| a.pos == b.pos);
+        let config = &self.config;
+        let patch_tc = config.patch_type_count;
+        let n_a_patches = config.particle_types[a_type].patches.len();
 
-        // ── 3. Build merged overlap-check arrays ──────────────────────────
-        s.overlap_particles.clear();
-        for &(center, radius) in regions {
-            let search_r = radius + self.config.max_cutoff() * 2.0;
-            let overlap_r = search_r + 4.0 * self.config.max_radius();
-            self.particle_grid.query_into(center.x, center.y, overlap_r, &mut s.particle_buf);
-            s.overlap_particles.extend_from_slice(&s.particle_buf);
-        }
-        s.overlap_particles.sort_unstable_by(|a, b| {
-            a.pos.x.total_cmp(&b.pos.x).then(a.pos.y.total_cmp(&b.pos.y))
-        });
-        s.overlap_particles.dedup_by(|a, b| a.pos == b.pos);
-
-        s.overlap_pos.clear();
-        s.overlap_rad.clear();
-        s.overlap_idx.clear();
-        for (i, p) in s.overlap_particles.iter().enumerate() {
-            s.overlap_pos.push(p.pos);
-            s.overlap_rad.push(p.radius);
-            s.overlap_idx.push(i);
+        // Non-patchy particles don't generate candidates in this scheme.
+        if n_a_patches == 0 || patch_tc == 0 {
+            return 0.0;
         }
 
-        // ── 4. For each focal particle A and each candidate type C, generate sites.
-        let delta = self.config.delta;
-        let max_radius = self.config.max_radius();
-        // Snapshot focal set to avoid aliasing with &mut self.regen_scratch below.
-        let focal_len = self.regen_scratch.focal_particles.len();
-        for fi in 0..focal_len {
-            let a_pos;
-            let a_r;
-            {
-                let p = &self.regen_scratch.focal_particles[fi];
-                a_pos = p.pos;
-                a_r = p.radius;
-            }
+        let delta = config.delta;
+        let mut total = 0.0f64;
 
-            let bonded_cutoff = a_r + max_radius + delta;
-            self.regen_scratch.bonded_dirs.clear();
-            self.particle_grid.query_iter(a_pos.x, a_pos.y, bonded_cutoff, |other| {
-                if other.pos == a_pos { return; }
-                let d = a_pos.distance(other.pos);
-                if d < a_r + other.radius + delta {
-                    let diff = other.pos - a_pos;
-                    self.regen_scratch.bonded_dirs.push(diff / d);
-                }
-            });
+        for pa_idx in 0..n_a_patches {
+            let (pa_type_id, pa_cs) = {
+                let p_a = &config.particle_types[a_type].patches[pa_idx];
+                (p_a.patch_type_id, p_a.position_cs)
+            };
+            // Lab-frame direction of this patch: a_ori * pa_cs (complex multiply).
+            let phi = Vec2::new(
+                a_ori.x * pa_cs.x - a_ori.y * pa_cs.y,
+                a_ori.x * pa_cs.y + a_ori.y * pa_cs.x,
+            );
 
-            for type_c in 0..self.config.n_types() {
-                let rc = self.config.radius(type_c);
+            for type_c in 0..config.n_types() {
+                let (rc, n_c_patches) = {
+                    let ct = &config.particle_types[type_c];
+                    (ct.radius, ct.patches.len())
+                };
+                let c_pos = a_pos + phi * (a_r + rc);
 
-                // ── 4a. Intersection sites ────────────────────────────────
-                let pair_search = a_r + rc + max_radius + rc + delta;
-                self.regen_scratch.particle_buf.clear();
-                self.particle_grid.query_into(a_pos.x, a_pos.y, pair_search, &mut self.regen_scratch.particle_buf);
-                let pb_len = self.regen_scratch.particle_buf.len();
-                for bi in 0..pb_len {
-                    let (b_pos, b_r) = {
-                        let b = &self.regen_scratch.particle_buf[bi];
-                        if (b.pos.x, b.pos.y) <= (a_pos.x, a_pos.y) { continue; }
-                        (b.pos, b.radius)
+                // Overlap check via direct grid query.
+                let overlap_query_r = rc + config.max_radius() + delta;
+                let mut has_overlap = false;
+                self.particle_grid.query_iter(c_pos.x, c_pos.y, overlap_query_r, |other| {
+                    if has_overlap { return; }
+                    let min_sep = rc + other.radius - delta;
+                    if min_sep > 0.0 && c_pos.distance_squared(other.pos) < min_sep * min_sep {
+                        has_overlap = true;
+                    }
+                });
+                if has_overlap { continue; }
+
+                // Find the best matching patch on C.
+                let mut best_energy = 0.0f32;
+                let mut best_c_ori = Vec2::X;
+                let mut found = false;
+
+                for pc_idx in 0..n_c_patches {
+                    let (pc_type_id, pc_cs) = {
+                        let p_c = &config.particle_types[type_c].patches[pc_idx];
+                        (p_c.patch_type_id, p_c.position_cs)
                     };
-                    
-                    let r_ac = a_r + rc;
-                    let r_bc = b_r + rc;
+                    if pa_type_id >= patch_tc || pc_type_id >= patch_tc { continue; }
 
-                    for maybe_pt in circle_intersections(a_pos, r_ac, b_pos, r_bc) {
-                        let Some(site_pos) = maybe_pt else { continue };
+                    let lut = &config.patch_lut[pa_type_id * patch_tc + pc_type_id];
+                    // epsilon < 0 means attractive; skip non-attractive pairs.
+                    if !lut.enabled || lut.epsilon >= 0.0 { continue; }
 
-                        let da = a_pos.distance(site_pos);
-                        let db = b_pos.distance(site_pos);
-                        if da < r_ac - delta || da > r_ac + delta { continue; }
-                        if db < r_bc - delta || db > r_bc + delta { continue; }
+                    // Orientation so P_C points toward A (direction -phi).
+                    let neg_phi = -phi;
+                    let c_ori = Vec2::new(
+                        neg_phi.x * pc_cs.x + neg_phi.y * pc_cs.y,
+                        neg_phi.y * pc_cs.x - neg_phi.x * pc_cs.y,
+                    );
 
-                        if site_has_overlap(site_pos, rc, delta,
-                            &self.regen_scratch.overlap_idx,
-                            &self.regen_scratch.overlap_pos,
-                            &self.regen_scratch.overlap_rad,
-                        ) { continue; }
-                        let (orientation, energy) = self.candidate_orientation_and_energy(site_pos, type_c);
-                        self.add_candidate(CandidateSite { pos: site_pos, type_id: type_c, orientation }, energy);
+                    let energy = self.site_energy_for_orientation(c_pos, type_c, c_ori);
+                    if energy < best_energy {
+                        best_energy = energy;
+                        best_c_ori = c_ori;
+                        found = true;
                     }
                 }
 
-                // ── 4b. Arc sites ─────────────────────────────────────────
-                let n_ang = self.config.num_isolated_angles;
-                let exclusion = TAU / n_ang as f32;
-                let r_contact = a_r + rc;
-                let max_arc = self.config.max_arc_sites_per_type;
-
-                let cos_excl = exclusion.cos();
-                self.regen_scratch.arc_candidates.clear();
-                for k in 0..n_ang {
-                    let theta = (k as f32) * TAU / (n_ang as f32);
-                    let theta_v = Vec2::new(theta.cos(), theta.sin());
-                    let blocked = self.regen_scratch.bonded_dirs.iter()
-                        .any(|&bd| theta_v.dot(bd) > cos_excl);
-                    if blocked { continue; }
-                    let site_pos = a_pos + theta_v * r_contact;
-                    if site_has_overlap(site_pos, rc, delta,
-                        &self.regen_scratch.overlap_idx,
-                        &self.regen_scratch.overlap_pos,
-                        &self.regen_scratch.overlap_rad,
-                    ) { continue; }
-                    self.regen_scratch.arc_candidates.push(site_pos);
-                }
-
-                let arc_len = self.regen_scratch.arc_candidates.len();
-                if arc_len <= max_arc {
-                    for ai in 0..arc_len {
-                        let pos = self.regen_scratch.arc_candidates[ai];
-                        let (orientation, energy) = self.candidate_orientation_and_energy(pos, type_c);
-                        self.add_candidate(CandidateSite { pos, type_id: type_c, orientation }, energy);
-                    }
-                } else {
-                    let step = arc_len as f32 / max_arc as f32;
-                    for i in 0..max_arc {
-                        let idx = (i as f32 * step) as usize;
-                        let pos = self.regen_scratch.arc_candidates[idx];
-                        let (orientation, energy) = self.candidate_orientation_and_energy(pos, type_c);
-                        self.add_candidate(CandidateSite { pos, type_id: type_c, orientation }, energy);
-                    }
-                }
+                if !found { continue; }
+                let _ = best_c_ori; // used in generate_candidates_for_particle
+                total += config.attach_rate(type_c, -best_energy) as f64;
             }
         }
-        self.timers[TimerEntry::RegenCandidates as usize] += rdtsc().wrapping_sub(t0);
-        self.usages[TimerEntry::RegenCandidates as usize] += 1;
+
+        total
     }
 
-    /// Rebuild the flat f32 particle buffer for the WASM export.
-    /// Layout per particle: [x, y, type_id, radius, orientation]
-    fn rebuild_particle_buf(&mut self) {
-        self.particle_buf.clear();
-        for p in self.particle_grid.iter() {
-            self.particle_buf.push(p.pos.x);
-            self.particle_buf.push(p.pos.y);
-            self.particle_buf.push(p.type_id as f32);
-            self.particle_buf.push(p.radius);
-            self.particle_buf.push(p.orientation.y.atan2(p.orientation.x));
+    /// Generate on-demand candidates for the particle at (cell, idx).
+    /// Returns Vec<(CandidateSite, rate)>.
+    fn generate_candidates_for_particle(&self, cell: usize, idx: usize) -> Vec<(CandidateSite, f64)> {
+        let (a_pos, a_r, a_type, a_ori) = {
+            let p = &self.particle_grid.cells[cell].particles[idx];
+            (p.pos, p.radius, p.type_id, p.orientation)
+        };
+
+        let config = &self.config;
+        let patch_tc = config.patch_type_count;
+        let n_a_patches = config.particle_types[a_type].patches.len();
+
+        if n_a_patches == 0 || patch_tc == 0 {
+            return Vec::new();
         }
-    }
 
-    /// Rebuild the flat f32 candidate buffer for the debug overlay.
-    /// Layout per candidate: [x, y, type_id, rate]
-    fn rebuild_candidate_buf(&mut self) {
-        self.candidate_buf.clear();
-        for (i, site) in self.candidates.iter().enumerate() {
-            let rate = self.attach_rates.get_rate(i);
-            self.candidate_buf.push(site.pos.x);
-            self.candidate_buf.push(site.pos.y);
-            self.candidate_buf.push(site.type_id as f32);
-            self.candidate_buf.push(rate as f32);
+        let delta = config.delta;
+        let mut result: Vec<(CandidateSite, f64)> = Vec::new();
+
+        for pa_idx in 0..n_a_patches {
+            let (pa_type_id, pa_cs) = {
+                let p_a = &config.particle_types[a_type].patches[pa_idx];
+                (p_a.patch_type_id, p_a.position_cs)
+            };
+            let phi = Vec2::new(
+                a_ori.x * pa_cs.x - a_ori.y * pa_cs.y,
+                a_ori.x * pa_cs.y + a_ori.y * pa_cs.x,
+            );
+
+            for type_c in 0..config.n_types() {
+                let (rc, n_c_patches) = {
+                    let ct = &config.particle_types[type_c];
+                    (ct.radius, ct.patches.len())
+                };
+                let c_pos = a_pos + phi * (a_r + rc);
+
+                let overlap_query_r = rc + config.max_radius() + delta;
+                let mut has_overlap = false;
+                self.particle_grid.query_iter(c_pos.x, c_pos.y, overlap_query_r, |other| {
+                    if has_overlap { return; }
+                    let min_sep = rc + other.radius - delta;
+                    if min_sep > 0.0 && c_pos.distance_squared(other.pos) < min_sep * min_sep {
+                        has_overlap = true;
+                    }
+                });
+                if has_overlap { continue; }
+
+                let mut best_energy = 0.0f32;
+                let mut best_c_ori = Vec2::X;
+                let mut found = false;
+
+                for pc_idx in 0..n_c_patches {
+                    let (pc_type_id, pc_cs) = {
+                        let p_c = &config.particle_types[type_c].patches[pc_idx];
+                        (p_c.patch_type_id, p_c.position_cs)
+                    };
+                    if pa_type_id >= patch_tc || pc_type_id >= patch_tc { continue; }
+
+                    let lut = &config.patch_lut[pa_type_id * patch_tc + pc_type_id];
+                    if !lut.enabled || lut.epsilon >= 0.0 { continue; }
+
+                    let neg_phi = -phi;
+                    let c_ori = Vec2::new(
+                        neg_phi.x * pc_cs.x + neg_phi.y * pc_cs.y,
+                        neg_phi.y * pc_cs.x - neg_phi.x * pc_cs.y,
+                    );
+
+                    let energy = self.site_energy_for_orientation(c_pos, type_c, c_ori);
+                    if energy < best_energy {
+                        best_energy = energy;
+                        best_c_ori = c_ori;
+                        found = true;
+                    }
+                }
+
+                if !found { continue; }
+                let rate = config.attach_rate(type_c, -best_energy) as f64;
+                result.push((CandidateSite { pos: c_pos, type_id: type_c, orientation: best_c_ori }, rate));
+            }
         }
+
+        result
     }
 
-    pub fn candidate_buf_ptr(&self) -> *const f32 {
-        self.candidate_buf.as_ptr()
+    /// Recompute and store the attach rate sum for the particle at (cell, idx).
+    fn update_attach_rate(&mut self, cell: usize, idx: usize) {
+        let rate = self.compute_attach_rate_sum(cell, idx);
+        let old = self.particle_grid.cells[cell].attach_rates[idx];
+        self.particle_grid.cells[cell].attach_rates[idx] = rate;
+        self.particle_grid.cells[cell].aggr_attach_rate += rate - old;
     }
 
-    pub fn candidate_count(&self) -> u32 {
-        self.candidates.len() as u32
+    /// Find the particle at `pos` in the grid and update its attach rate.
+    fn update_attach_rate_for_particle_at(&mut self, pos: Vec2) {
+        let key = self.particle_grid.cell_key(pos.x, pos.y);
+        let cell_idx = match self.particle_grid.cell_map.get(&key) {
+            Some(&i) => i,
+            None => return,
+        };
+        let part_idx = match self.particle_grid.cells[cell_idx].particles.iter().position(|p| p.pos == pos) {
+            Some(i) => i,
+            None => return,
+        };
+        self.update_attach_rate(cell_idx, part_idx);
+    }
+
+    /// Update attach rates for all particles within interaction range of `pos`.
+    fn update_neighbors_attach_rates(&mut self, pos: Vec2) {
+        let radius = self.config.max_cutoff() * 2.0 + self.config.max_radius();
+        let neighbor_pos: Vec<Vec2> = self.particle_grid
+            .query(pos.x, pos.y, radius)
+            .into_iter()
+            .map(|p| p.pos)
+            .collect();
+        for npos in neighbor_pos {
+            self.update_attach_rate_for_particle_at(npos);
+        }
     }
 
     // ── Public getters ────────────────────────────────────────────────────────
@@ -893,14 +786,39 @@ impl Simulation {
         self.particle_buf.as_ptr()
     }
 
+    /// Rebuild the flat f32 particle buffer for the WASM export.
+    /// Layout per particle: [x, y, type_id, radius, orientation]
+    fn rebuild_particle_buf(&mut self) {
+        self.particle_buf.clear();
+        for p in self.particle_grid.iter() {
+            self.particle_buf.push(p.pos.x);
+            self.particle_buf.push(p.pos.y);
+            self.particle_buf.push(p.type_id as f32);
+            self.particle_buf.push(p.radius);
+            self.particle_buf.push(p.orientation.y.atan2(p.orientation.x));
+        }
+    }
+
+    /// Return a JSON string with per-type metadata (color, radius, patches) for the renderer.
+    pub fn type_metadata_json(&self) -> String {
+        let entries: Vec<String> = self
+            .config
+            .particle_types
+            .iter()
+            .map(|t| {
+                let patches: Vec<String> = t.patches.iter().map(|p| {
+                    format!(r##"{{"angle_rad":{:.6},"color":"#ffffff"}}"##, p.position_rad)
+                }).collect();
+                format!(
+                    r#"{{"color":"{}","radius":{},"patches":[{}]}}"#,
+                    t.color, t.radius, patches.join(",")
+                )
+            })
+            .collect();
+        format!("[{}]", entries.join(","))
+    }
+
     /// Fixed-grid relaxation variant.
-    ///
-    /// Instead of dynamically growing an active set, this activates **all** particles
-    /// in a 5×5 cell neighbourhood around the new particle immediately, backed by a
-    /// `(5 + 2*cell_r)²` initialised border.  `Cell` indices are cached before
-    /// the loop so the hot inner loops use array indexing instead of HashMap lookups.
-    ///
-    /// Swap for `relax_new_particle` at the call site in `attach` to compare.
     fn relax_new_particle_fixed_grid(&mut self, new_p: Particle) {
         if self.config.relax_steps == 0 { return; }
 
@@ -914,7 +832,7 @@ impl Simulation {
         let center    = self.particle_grid.cell_key(new_p.pos.x, new_p.pos.y);
         let query_r   = max_radius * lj_cutoff_factor * 2.0 + 1e-6;
         let cell_r    = (query_r / cell_size).ceil() as i64;
-        let act_half  = 3i64;              // 5×5 active zone
+        let act_half  = 1i64;              // 5×5 active zone
         let init_half = act_half + cell_r; // margin so every active particle sees full LJ range
         let w         = (2 * init_half + 1) as usize;
         let n         = w * w;
@@ -958,7 +876,6 @@ impl Simulation {
         let initialized_cell_indices: Vec<usize> =
             cell_ind.iter().filter_map(|&idx| idx).collect();
 
-        // let t0 = rdtsc();
         // ── Relaxation loop ───────────────────────────────────────────────────
         for _ in 0..self.config.relax_steps {
             // Zero forces and torques.
@@ -1013,7 +930,6 @@ impl Simulation {
                                 let b_frz  = b_cell.is_frozen[bi];
 
                                 let r_contact = a_r + b_r;
-                                // Quick distance cull before full patchy computation.
                                 let r2 = (b_pos - a_pos).length_squared();
                                 let r_cut = r_contact * lj_cutoff_factor;
                                 if r2 >= r_cut * r_cut { continue; }
@@ -1084,7 +1000,6 @@ impl Simulation {
                     let (s, c) = omega_new.sin_cos();
                     let ori = cell.particles[ind].orientation;
                     let new_ori = Vec2::new(ori.x * c - ori.y * s, ori.x * s + ori.y * c);
-                    // Renormalize to prevent floating-point drift.
                     let len_sq = new_ori.length_squared();
                     cell.new_orientation[ind] = if (len_sq - 1.0).abs() > 1e-6 {
                         new_ori / len_sq.sqrt()
@@ -1103,17 +1018,11 @@ impl Simulation {
             if converged { break; }
         }
 
-        // ── Post-relaxation: update rates and regen candidates ────────────────
-        // Query the live grid rather than stale cell_ind: particles can shift
-        // into cells that didn't exist when cell_ind was built, so a cell_ind
-        // walk would miss their final positions and leave stale candidates.
-        let delta   = self.config.delta;
-        let regen_r = self.config.max_cutoff() * 2.0;
+        // ── Post-relaxation: update detach rates and attach rate sums ─────────
+        let delta     = self.config.delta;
         let act_radius = act_half as f32 * cell_size + cell_size;
         let mut rate_particles: Vec<Particle> = Vec::new();
-        let mut regen_regions:  Vec<(Vec2, f32)> = Vec::new();
         self.particle_grid.query_into(new_p.pos.x, new_p.pos.y, act_radius, &mut rate_particles);
-        for p in &rate_particles { regen_regions.push((p.pos, regen_r)); }
 
         // Include bonded neighbours outside the active zone.
         let mut bonded: Vec<Particle> = Vec::new();
@@ -1129,29 +1038,18 @@ impl Simulation {
         rate_particles.dedup_by(|a, b| a.pos == b.pos);
         for p in &rate_particles { self.update_detach_rate(p); }
 
-        self.regen_candidates_batch(&regen_regions);
+        // Update attach rates for all particles in the active zone and neighbours.
+        let update_r = act_radius + self.config.max_cutoff() * 2.0;
+        let to_update_pos: Vec<Vec2> = self.particle_grid
+            .query(new_p.pos.x, new_p.pos.y, update_r)
+            .into_iter()
+            .map(|p| p.pos)
+            .collect();
+        for pos in to_update_pos {
+            self.update_attach_rate_for_particle_at(pos);
+        }
 
         let initialized: HashSet<(i64, i64)> = keys.iter().copied().collect();
         self.particle_grid.clear_physics_for_cells(&initialized);
-    }
-
-    /// Return a JSON string with per-type metadata (color, radius, patches) for the renderer.
-    pub fn type_metadata_json(&self) -> String {
-        let entries: Vec<String> = self
-            .config
-            .particle_types
-            .iter()
-            .map(|t| {
-                let patches: Vec<String> = t.patches.iter().map(|p| {
-                    // r##"..."## avoids the `"#` closing the raw string inside "#ffffff".
-                    format!(r##"{{"angle_rad":{:.6},"color":"#ffffff"}}"##, p.position_rad)
-                }).collect();
-                format!(
-                    r#"{{"color":"{}","radius":{},"patches":[{}]}}"#,
-                    t.color, t.radius, patches.join(",")
-                )
-            })
-            .collect();
-        format!("[{}]", entries.join(","))
     }
 }

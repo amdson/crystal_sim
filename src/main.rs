@@ -242,26 +242,32 @@ impl eframe::App for CrystalApp {
             //     }
             // }
 
-            // Candidate sites
-            if self.show_candidates && !self.sim.candidates.is_empty() {
-                let max_rate = (0..self.sim.candidates.len())
-                    .map(|i| self.sim.attach_rates.get_rate(i))
+            // Attach-rate halos: ring around each particle scaled by its attach_rate_sum.
+            if self.show_candidates {
+                let max_rate = self.sim.particle_grid.cells.iter()
+                    .flat_map(|c| c.attach_rates.iter().copied())
                     .fold(0.0f64, f64::max);
                 let max_rate = if max_rate > 0.0 { max_rate } else { 1.0 };
 
-                for (i, site) in self.sim.candidates.iter().enumerate() {
-                    let pos = self.sim_to_screen(site.pos.x, site.pos.y, rect);
-                    if pos.x < rect.left() - 20.0 || pos.x > rect.right() + 20.0
-                        || pos.y < rect.top() - 20.0 || pos.y > rect.bottom() + 20.0
-                    {
-                        continue;
+                for cell in &self.sim.particle_grid.cells {
+                    for (idx, p) in cell.particles.iter().enumerate() {
+                        let rate = cell.attach_rates[idx];
+                        if rate == 0.0 { continue; }
+                        let pos = self.sim_to_screen(p.pos.x, p.pos.y, rect);
+                        if pos.x < rect.left() - 50.0 || pos.x > rect.right() + 50.0
+                            || pos.y < rect.top() - 50.0 || pos.y > rect.bottom() + 50.0
+                        { continue; }
+                        let t = (rate / max_rate) as f32;
+                        let screen_r = (p.radius + 0.15) * self.zoom;
+                        let alpha = ((0.2 + t * 0.6) * 255.0) as u8;
+                        let color = self.colors.get(p.type_id).copied().unwrap_or(Color32::WHITE);
+                        let [r, g, b, _] = color.to_array();
+                        painter.circle_stroke(
+                            pos,
+                            screen_r,
+                            Stroke::new(1.5 + t * 2.0, Color32::from_rgba_unmultiplied(r, g, b, alpha)),
+                        );
                     }
-                    let t = (self.sim.attach_rates.get_rate(i) / max_rate) as f32;
-                    let dot_r = 1.5 + t * 4.5;
-                    let alpha = ((0.25 + t * 0.55) * 255.0) as u8;
-                    let color = self.colors.get(site.type_id).copied().unwrap_or(Color32::WHITE);
-                    let [r, g, b, _] = color.to_array();
-                    painter.circle_filled(pos, dot_r, Color32::from_rgba_unmultiplied(r, g, b, alpha));
                 }
             }
 
