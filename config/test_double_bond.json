@@ -1,0 +1,69 @@
+{
+  "particle_types": [
+    {
+      "radius": 1.0,
+      "color": "#4a90d9",
+      "mu": -2.0,
+      "patches": [
+        { "patch_type": "A", "position_deg": 0.0 }
+      ]
+    },
+    {
+      "radius": 1.0,
+      "color": "#e84040",
+      "mu": -2.0,
+      "patches": [
+        { "patch_type": "A", "position_deg": 0.0 },
+        { "patch_type": "A", "position_deg": 60.0 }
+      ]
+    }
+  ],
+  "epsilon": [
+    [0.15, 0.15],
+    [0.15, 0.15]
+  ],
+  "patch_interactions": [
+    {
+      "types": ["A", "A"],
+      "epsilon": -1.0,
+      "angular_width_deg": [30.0, 30.0],
+      "cutoff": 1.25
+    }
+  ],
+  "delta": 0.3,
+  "temperature": 0.2,
+  "nu": 0.05,
+  "seed": 42,
+  "testing_mode": true,
+  "print_test_diagnostics": false,
+  "initial_particles": [
+    { "x": 0.0, "y": 0.0,   "type_id": 0, "orientation_deg":  60.0, "frozen": true, "no_detach": true },
+    { "x": 2.0, "y": 0.0,   "type_id": 0, "orientation_deg": 120.0, "frozen": true, "no_detach": true }
+  ],
+  "energy_probes": [
+    {
+      "description": "type-1 at double-bond site (1, sqrt(3))",
+      "x": 1.0,
+      "y": 1.7320508,
+      "type_id": 1,
+      "orientation_deg": 240.0,
+      "expected_energy": -2.0,
+      "tolerance": 0.05
+    }
+  ],
+  "candidate_coverage_tests": [
+    {
+      "description": "type-1 double-bond site must be sampled",
+      "type_id": 1,
+      "min_best_energy": -1.5
+    }
+  ],
+  "rate_assertions": [
+    {
+      "description": "type-1 total attach rate reflects double bond",
+      "type_id": 1,
+      "min_rate": 1.0,
+      "max_rate": 1e10
+    }
+  ]
+}

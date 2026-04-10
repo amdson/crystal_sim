@@ -122,8 +122,11 @@ impl Simulation {
                     "[testing_mode] warning: fewer than 2 particles loaded; net interaction torques will be zero."
                 );
             }
+            sim.run_test_assertions();
         } else {
-            if sim.config.n_types() >= 1 {
+            if !sim.config.initial_particles.is_empty() || !sim.config.initial_lines.is_empty() {
+                sim.load_preset_particles();
+            } else if sim.config.n_types() >= 1 {
                 let r0 = sim.config.radius(0);
                 sim.add_particle_raw(Particle::new(0.0, 0.0, 0, r0, Vec2::X));
                 // Compute initial attach rate for the seed particle.
@@ -134,6 +137,7 @@ impl Simulation {
                     }
                 }
             }
+            sim.run_test_assertions();
         }
         sim
     }
@@ -151,9 +155,16 @@ impl Simulation {
             let t0_sel = rdtsc();
             let attach_total = self.particle_grid.total_attach_rate();
             let detach_total = self.particle_grid.total_rate();
-            let r_total = attach_total + detach_total;
-            if r_total <= 0.0 {
-                break;
+
+            let r_total = match self.particle_grid.total_particles <= 1 {
+                true => attach_total,
+                false => attach_total + detach_total,
+            };
+
+
+            if r_total <= 0.0 || !r_total.is_finite() || self.config.print_rate_diagnostics {
+                self.print_rate_diagnostics();
+                // break;
             }
 
             let u1 = self.rng.next_f64();
@@ -179,7 +190,9 @@ impl Simulation {
                 self.usages[TimerEntry::Select as usize] += 1;
 
                 let t0 = rdtsc();
+
                 self.detach(detach_u);
+                // self.detach(detach_u);
                 self.timers[TimerEntry::Detach as usize] += rdtsc().wrapping_sub(t0);
                 self.usages[TimerEntry::Detach as usize] += 1;
             }
@@ -241,6 +254,62 @@ impl Simulation {
         }
     }
 
+    /// Place preset particles (from `config.initial_particles` and `config.initial_lines`)
+    /// into the KMC grid, applying `frozen` and `no_detach` flags, then seed rates.
+    fn load_preset_particles(&mut self) {
+        // Expand lines into individual particle defs and merge with explicit particles.
+        use crate::config::InitialParticleDef;
+        let mut presets = self.config.initial_particles.clone();
+        for line in &self.config.initial_lines.clone() {
+            if line.count == 0 || line.type_id >= self.config.n_types() {
+                continue;
+            }
+            let dir_rad = line.direction_deg * PI / 180.0;
+            let step = Vec2::new(dir_rad.cos(), dir_rad.sin()) * line.spacing;
+            for i in 0..line.count {
+                if i == 0 && line.skip_first {
+                    continue;
+                }
+                let offset = step * i as f32;
+                presets.push(InitialParticleDef {
+                    x: line.x + offset.x,
+                    y: line.y + offset.y,
+                    type_id: line.type_id,
+                    orientation_deg: line.orientation_deg,
+                    frozen: line.frozen,
+                    no_detach: line.no_detach,
+                });
+            }
+        }
+
+        for init in &presets {
+            if init.type_id >= self.config.n_types() {
+                continue;
+            }
+            let radius = self.config.radius(init.type_id);
+            let ori_rad = init.orientation_deg * PI / 180.0;
+            let orientation = Vec2::new(ori_rad.cos(), ori_rad.sin());
+            let p = Particle::new(init.x, init.y, init.type_id, radius, orientation);
+            self.add_particle_raw(p.clone());
+            if init.frozen {
+                self.particle_grid.mark_permanently_frozen_at(p.pos);
+            }
+            if init.no_detach {
+                self.particle_grid.mark_no_detach_at(p.pos);
+            }
+        }
+        // Seed attach rates for all preset particles so new particles can bond to them.
+        let positions: Vec<Vec2> = self.particle_grid.iter().map(|p| p.pos).collect();
+        for pos in positions {
+            self.update_attach_rate_for_particle_at(pos);
+        }
+        // Seed detach rates for preset particles that allow detachment.
+        let particles: Vec<Particle> = self.particle_grid.iter().cloned().collect();
+        for p in &particles {
+            self.update_detach_rate(p);
+        }
+    }
+
     fn sync_testing_particles_to_grid(&mut self) {
         let cell_size = self.particle_grid.cell_size;
         self.particle_grid = ParticleGrid::new(cell_size);
@@ -296,6 +365,7 @@ impl Simulation {
                     self.config.patch_type_count,
                     self.config.epsilon(a.type_id, b.type_id),
                     self.config.lj_cutoff_factor,
+                    self.config.spring_k,
                 );
 
                 forces[i] += f_i;
@@ -781,6 +851,154 @@ impl Simulation {
         }
     }
 
+    /// Run all test assertions (energy probes, candidate coverage, rate assertions).
+    /// Prints PASS/FAIL for each; returns false if any failed.
+    pub fn run_test_assertions(&self) -> bool {
+        let mut all_pass = true;
+
+        // ── Level 1: Energy probes ────────────────────────────────────────────
+        for probe in &self.config.energy_probes {
+            let pos = Vec2::new(probe.x, probe.y);
+            let ori_rad = probe.orientation_deg * PI / 180.0;
+            let orientation = Vec2::new(ori_rad.cos(), ori_rad.sin());
+            let energy = self.site_energy_for_orientation(pos, probe.type_id, orientation);
+            let diff = (energy - probe.expected_energy).abs();
+            let pass = diff <= probe.tolerance;
+            if !pass { all_pass = false; }
+            let label = probe.description.as_deref().unwrap_or("(unnamed)");
+            println!(
+                "[energy_probe] {:40} energy={:+.6e}  expected={:+.6e}  diff={:.2e}  tol={:.2e}  {}",
+                label, energy, probe.expected_energy, diff, probe.tolerance,
+                if pass { "PASS" } else { "FAIL" }
+            );
+        }
+
+        // ── Level 2: Candidate coverage tests ────────────────────────────────
+        for test in &self.config.candidate_coverage_tests {
+            let type_c = test.type_id;
+            let mut best_energy = f32::INFINITY;
+            let mut best_pos = Vec2::ZERO;
+            let mut total_candidates = 0usize;
+
+            for cell_idx in 0..self.particle_grid.cells.len() {
+                let n = self.particle_grid.cells[cell_idx].particles.len();
+                for part_idx in 0..n {
+                    let candidates = self.generate_candidates_for_particle(cell_idx, part_idx);
+                    for (site, _rate) in &candidates {
+                        if site.type_id != type_c { continue; }
+                        total_candidates += 1;
+                        let e = self.site_energy_for_orientation(site.pos, type_c, site.orientation);
+                        if e < best_energy {
+                            best_energy = e;
+                            best_pos = site.pos;
+                        }
+                    }
+                }
+            }
+
+            let pass = best_energy <= test.min_best_energy;
+            if !pass { all_pass = false; }
+            let label = test.description.as_deref().unwrap_or("(unnamed)");
+            println!(
+                "[candidate_coverage] {:36} type={}  candidates={}  best_energy={:+.6e}  threshold={:+.6e}  best_pos=({:.3},{:.3})  {}",
+                label, type_c, total_candidates, best_energy, test.min_best_energy,
+                best_pos.x, best_pos.y,
+                if pass { "PASS" } else { "FAIL" }
+            );
+        }
+
+        // ── Level 3: Rate assertions ──────────────────────────────────────────
+        for assertion in &self.config.rate_assertions {
+            let type_c = assertion.type_id;
+            let mut total_rate = 0.0f64;
+
+            for cell_idx in 0..self.particle_grid.cells.len() {
+                let n = self.particle_grid.cells[cell_idx].particles.len();
+                for part_idx in 0..n {
+                    let candidates = self.generate_candidates_for_particle(cell_idx, part_idx);
+                    for (site, rate) in &candidates {
+                        if site.type_id == type_c {
+                            total_rate += rate;
+                        }
+                    }
+                }
+            }
+
+            let pass = total_rate >= assertion.min_rate && total_rate <= assertion.max_rate;
+            if !pass { all_pass = false; }
+            let label = assertion.description.as_deref().unwrap_or("(unnamed)");
+            println!(
+                "[rate_assertion] {:40} type={}  rate={:.6e}  range=[{:.6e}, {:.6e}]  {}",
+                label, type_c, total_rate, assertion.min_rate, assertion.max_rate,
+                if pass { "PASS" } else { "FAIL" }
+            );
+        }
+
+        if !self.config.energy_probes.is_empty()
+            || !self.config.candidate_coverage_tests.is_empty()
+            || !self.config.rate_assertions.is_empty()
+        {
+            println!("[test_assertions] {}", if all_pass { "ALL PASS" } else { "SOME FAILED" });
+        }
+
+        all_pass
+    }
+
+    /// Print min/max/mean attach and detach rates for every particle, plus binding energies.
+    /// Useful for diagnosing stalled simulations at low temperature.
+    pub fn print_rate_diagnostics(&self) {
+        fn stats(v: &[f64]) -> (f64, f64, f64) {
+            let min  = v.iter().cloned().fold(f64::INFINITY,     f64::min);
+            let max  = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let mean = v.iter().sum::<f64>() / v.len() as f64;
+            (min, max, mean)
+        }
+
+        let n          = self.particle_grid.len();
+        let temp       = self.config.temperature;
+        let nu         = self.config.nu;
+        let att_total  = self.particle_grid.total_attach_rate();
+        let det_total  = self.particle_grid.total_rate();
+        let ratio      = if det_total > 0.0 { att_total / det_total } else { f64::INFINITY };
+
+        println!("=== Rate Diagnostics (T={:.4e}  nu={:.4e}  particles={}) ===", temp, nu, n);
+        println!("  total: attach={:.4e}  detach={:.4e}  attach/detach={:.4e}", att_total, det_total, ratio);
+
+        let mut attach_rates: Vec<f64> = Vec::new();
+        let mut detach_rates: Vec<f64> = Vec::new();
+        for cell in &self.particle_grid.cells {
+            attach_rates.extend_from_slice(&cell.attach_rates);
+            detach_rates.extend_from_slice(&cell.rates);
+        }
+
+        if !attach_rates.is_empty() {
+            let (mn, mx, mean) = stats(&attach_rates);
+            let zeros = attach_rates.iter().filter(|&&r| r == 0.0).count();
+            println!("  attach/particle: min={:.4e}  max={:.4e}  mean={:.4e}  zeros={}/{}", mn, mx, mean, zeros, attach_rates.len());
+        }
+        if !detach_rates.is_empty() {
+            let (mn, mx, mean) = stats(&detach_rates);
+            let zeros = detach_rates.iter().filter(|&&r| r == 0.0).count();
+            println!("  detach/particle: min={:.4e}  max={:.4e}  mean={:.4e}  zeros={}/{}", mn, mx, mean, zeros, detach_rates.len());
+        }
+
+        // Binding energies require cloning particles first to avoid double-borrow.
+        let particles: Vec<_> = self.particle_grid.iter().cloned().collect();
+        if !particles.is_empty() {
+            let energies: Vec<f64> = particles.iter().map(|p| self.binding_energy(p) as f64).collect();
+            let (e_min, e_max, e_mean) = stats(&energies);
+            println!("  binding_energy:  min={:.4e}  max={:.4e}  mean={:.4e}", e_min, e_max, e_mean);
+
+            // Show what attach/detach rates would look like at the observed energy extremes.
+            let e_bind_min = e_min as f32;
+            let e_bind_max = e_max as f32;
+            println!("  attach_rate(e_bind_min={:.4e}) = {:.4e}", e_bind_min, self.config.attach_rate(0, -e_bind_min));
+            println!("  attach_rate(e_bind_max={:.4e}) = {:.4e}", e_bind_max, self.config.attach_rate(0, -e_bind_max));
+            println!("  detach_rate(e_bind_min={:.4e}) = {:.4e}", e_bind_min, self.config.detach_rate(e_bind_min));
+            println!("  detach_rate(e_bind_max={:.4e}) = {:.4e}", e_bind_max, self.config.detach_rate(e_bind_max));
+        }
+    }
+
     pub fn particle_buf_ptr(&self) -> *const f32 {
         self.particle_buf.as_ptr()
     }
@@ -835,7 +1053,7 @@ impl Simulation {
         let center    = self.particle_grid.cell_key(new_p.pos.x, new_p.pos.y);
         let query_r   = max_radius * lj_cutoff_factor * 2.0 + 1e-6;
         let cell_r    = (query_r / cell_size).ceil() as i64;
-        let act_half  = 1i64;              // 5×5 active zone
+        let act_half  = 5i64;              // 5×5 active zone
         let init_half = act_half + cell_r; // margin so every active particle sees full LJ range
         let w         = (2 * init_half + 1) as usize;
         let n         = w * w;
@@ -868,7 +1086,12 @@ impl Simulation {
         for &s in &active_slots {
             if let Some(cell_idx) = cell_ind[s] {
                 let cell = &mut self.particle_grid.cells[cell_idx];
-                cell.is_active.iter_mut().for_each(|a| *a = true);
+                for i in 0..cell.is_active.len() {
+                    // Permanently frozen particles must never be activated.
+                    if !cell.permanently_frozen[i] {
+                        cell.is_active[i] = true;
+                    }
+                }
             }
         }
 
@@ -948,6 +1171,7 @@ impl Simulation {
                                     self.config.patch_type_count,
                                     self.config.epsilon(a_type, b_type),
                                     self.config.lj_cutoff_factor,
+                                    self.config.spring_k,
                                 );
 
                                 if f != Vec2::ZERO || tau_a != 0.0 {

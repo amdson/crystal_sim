@@ -65,6 +65,32 @@ pub struct ParticleTypeDef {
     pub patches: Vec<PatchDef>,
 }
 
+/// Generates a row of identical particles spaced evenly along a direction.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct InitialLineDef {
+    /// Position of the first particle (or the skipped origin if `skip_first` is true).
+    pub x: f32,
+    pub y: f32,
+    pub type_id: usize,
+    /// Body-frame orientation applied to every particle in the line.
+    #[serde(default)]
+    pub orientation_deg: f32,
+    /// Direction the line extends in, in degrees (0 = +x, 90 = +y).
+    pub direction_deg: f32,
+    /// Centre-to-centre distance between consecutive particles.
+    pub spacing: f32,
+    /// Total number of particles to place (before skip_first is applied).
+    pub count: usize,
+    /// Skip placing the particle at (x, y) — useful when that position is
+    /// already occupied by another group's particle (e.g. a shared origin).
+    #[serde(default)]
+    pub skip_first: bool,
+    #[serde(default)]
+    pub frozen: bool,
+    #[serde(default)]
+    pub no_detach: bool,
+}
+
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct InitialParticleDef {
     pub x: f32,
@@ -72,8 +98,48 @@ pub struct InitialParticleDef {
     pub type_id: usize,
     #[serde(default)]
     pub orientation_deg: f32,
+    /// If true, this particle will not move during relaxation steps.
     #[serde(default)]
     pub frozen: bool,
+    /// If true, this particle will never be selected for KMC detachment.
+    #[serde(default)]
+    pub no_detach: bool,
+}
+
+/// Assert that the energy at a specific position/orientation matches expectation.
+#[derive(Deserialize, Clone, Debug)]
+pub struct EnergyProbe {
+    /// Human-readable label printed in test output.
+    #[serde(default)]
+    pub description: Option<String>,
+    pub x: f32,
+    pub y: f32,
+    pub type_id: usize,
+    pub orientation_deg: f32,
+    pub expected_energy: f32,
+    /// Absolute tolerance: |actual - expected| <= tolerance to pass.
+    pub tolerance: f32,
+}
+
+/// Assert that at least one generated candidate for `type_id` achieves energy
+/// at or below `min_best_energy`. Fails when the double-bond site is not sampled.
+#[derive(Deserialize, Clone, Debug)]
+pub struct CandidateCoverageTest {
+    #[serde(default)]
+    pub description: Option<String>,
+    pub type_id: usize,
+    /// Energy ceiling: the best candidate must have energy <= this value.
+    pub min_best_energy: f32,
+}
+
+/// Assert that the total attachment rate for `type_id` lies within [min_rate, max_rate].
+#[derive(Deserialize, Clone, Debug)]
+pub struct RateAssertion {
+    #[serde(default)]
+    pub description: Option<String>,
+    pub type_id: usize,
+    pub min_rate: f64,
+    pub max_rate: f64,
 }
 
 /// Full simulation configuration passed from JS as a JSON string.
@@ -128,9 +194,26 @@ pub struct SimConfig {
     /// Print per-particle diagnostics (energy / force / torque) each test step.
     #[serde(default = "default_print_test_diagnostics")]
     pub print_test_diagnostics: bool,
-    /// Explicit initial particle placements for testing mode.
+    /// Print min/max/mean attach and detach rate diagnostics when the simulation stalls (r_total=0).
+    #[serde(default)]
+    pub print_rate_diagnostics: bool,
+    /// Explicit initial particle placements.
     #[serde(default)]
     pub initial_particles: Vec<InitialParticleDef>,
+    /// Generate lines (spokes) of particles. Expanded at sim init time.
+    #[serde(default)]
+    pub initial_lines: Vec<InitialLineDef>,
+
+    // ── Test assertions (evaluated at startup) ───────────────────────────────
+    /// Level 1: check energy function at known positions.
+    #[serde(default)]
+    pub energy_probes: Vec<EnergyProbe>,
+    /// Level 2: check that candidate generator finds sites with sufficient energy.
+    #[serde(default)]
+    pub candidate_coverage_tests: Vec<CandidateCoverageTest>,
+    /// Level 3: check that total attach rate for a type is within expected bounds.
+    #[serde(default)]
+    pub rate_assertions: Vec<RateAssertion>,
 
     // Cached / computed fields (not serialised)
     /// Cached largest particle radius (computed after deserialization)

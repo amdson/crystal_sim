@@ -6,34 +6,25 @@
       "mu": -3.5,
       "patches": [
         { "patch_type": "EB",  "position_deg":   0.0 },
-        { "patch_type": "NEB", "position_deg":  60.0 },
+        { "patch_type": "EB", "position_deg":  60.0 },
         { "patch_type": "EB",  "position_deg":   120.0 },
-        { "patch_type": "NEB", "position_deg":  180.0 },
+        { "patch_type": "EB", "position_deg":  180.0 },
         { "patch_type": "EB",  "position_deg":   240.0 },
-        { "patch_type": "NEB", "position_deg":  300.0 }
+        { "patch_type": "EB", "position_deg":  300.0 }
       ]
     },
     {
       "radius": 1.0,
       "color": "#8a8a8a",
-      "mu": -2.3,
+      "mu": -2.6,
       "patches": [
         { "patch_type": "WB", "position_deg": 180.0 },
         { "patch_type": "EB", "position_deg":   0.0 },
         { "patch_type": "NW", "position_deg":   120.0 },
-        { "patch_type": "NE1", "position_deg":   60.0 }
+        { "patch_type": "NE1", "position_deg":   60.0 }, 
+        { "patch_type": "SE", "position_deg": 240.0 },
+        { "patch_type": "E1",  "position_deg":   300.0 }
 
-      ]
-    },
-    {
-      "radius": 1.0,
-      "color": "#8a8a8a",
-      "mu": -2.3,
-      "patches": [
-        { "patch_type": "SWB", "position_deg": 240.0 },
-        { "patch_type": "NEB", "position_deg":  60.0 },
-        { "patch_type": "SE", "position_deg": 300.0 },
-        { "patch_type": "E1",  "position_deg":   0.0 }
       ]
     },
     {
@@ -91,13 +82,13 @@
     }
   ],
   "epsilon": [
-    [0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35],
-    [0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35],
-    [0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35],
-    [0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35],
-    [0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35],
-    [0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35],
-    [0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35]
+    [0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15],
+    [0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15],
+    [0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15],
+    [0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15],
+    [0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15],
+    [0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15],
+    [0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15]
   ],
   "delta": 0.2,
   "temperature": 0.2,
@@ -117,32 +108,32 @@
       "types": ["EB", "WB"],
       "epsilon": -3.5,
       "angular_width_deg": [30.0, 30.0],
-      "cutoff": 1.5
+      "cutoff": 1.25
     },
     {
       "types": ["NEB", "SWB"],
       "epsilon": -3.5,
       "angular_width_deg": [30.0, 30.0],
-      "cutoff": 1.5
+      "cutoff": 1.25
     },
 
     {
       "types": ["E0", "W0"],
       "epsilon": -0.85,
       "angular_width_deg": [30.0, 30.0],
-      "cutoff": 1.5
+      "cutoff": 1.25
     },
     {
       "types": ["E1", "W1"],
       "epsilon": -0.85,
       "angular_width_deg": [30.0, 30.0],
-      "cutoff": 1.5
+      "cutoff": 1.25
     },
     {
       "types": ["NE0", "SW0"],
       "epsilon": -0.85,
       "angular_width_deg": [30.0, 30.0],
-      "cutoff": 1.5
+      "cutoff": 1.25
     },
     {
       "types": ["NE1", "SW1"],
@@ -154,7 +145,7 @@
       "types": ["NW", "SE"],
       "epsilon": -0.1,
       "angular_width_deg": [30.0, 30.0],
-      "cutoff": 1.5
+      "cutoff": 1.25
     }
   ],
   "print_rate_diagnostics": true

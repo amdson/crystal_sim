@@ -1,0 +1,119 @@
+{
+  "particle_types": [
+    {
+      "radius": 1,
+      "color": "#4a90d9",
+      "mu": 0,
+      "patches": [
+        {
+          "patch_type": "A",
+          "position_deg": 0.0
+        },
+        {
+          "patch_type": "A",
+          "position_deg": 180.0
+        }
+      ]
+    },
+    {
+      "radius": 1,
+      "color": "#e84040",
+      "mu": -0.75,
+      "patches": [
+        {
+          "patch_type": "A",
+          "position_deg": 190.1
+        },
+        {
+          "patch_type": "A",
+          "position_deg": 260.1
+        },
+        {
+          "patch_type": "A",
+          "position_deg": 45.0
+        }
+      ]
+    }
+  ],
+  "epsilon": [
+    [
+      0,
+      0
+    ],
+    [
+      0,
+      0
+    ]
+  ],
+  "delta": 0.2,
+  "temperature": 0.5,
+  "nu": 0.05,
+  "seed": 42,
+  "num_isolated_angles": 16,
+  "max_arc_sites_per_type": 6,
+  "relax_steps": 20,
+  "relax_alpha": 0.015,
+  "spring_k": 50,
+  "lj_cutoff_factor": 3,
+  "static_friction": 0.12,
+  "steps_per_frame": 10,
+  "relax_damping": 0.8,
+  "patch_interactions": [
+    {
+      "types": [
+        "A",
+        "A"
+      ],
+      "epsilon": -5.0,
+      "angular_width_deg": [
+        15,
+        15
+      ],
+      "cutoff": 1.7
+    }
+  ],
+  "initial_particles": [
+    {
+      "x": -3.965999755859375,
+      "y": 1.2659999084472657,
+      "type_id": 0,
+      "orientation_deg": 0,
+      "frozen": false
+    },
+    {
+      "x": -2.574000244140625,
+      "y": 0.5139997863769531,
+      "type_id": 1,
+      "orientation_deg": 0,
+      "frozen": false
+    },
+    {
+      "x": -1.39,
+      "y": 2.3540000915527344,
+      "type_id": 0,
+      "orientation_deg": 0,
+      "frozen": false
+    },
+    {
+      "x": -0.79800048828125,
+      "y": 0.4180000305175781,
+      "type_id": 0,
+      "orientation_deg": 0,
+      "frozen": false
+    },
+    {
+      "x": 1.76199951171875,
+      "y": 1.073999786376953,
+      "type_id": 1,
+      "orientation_deg": 0,
+      "frozen": false
+    },
+    {
+      "x": 1.5060009765625,
+      "y": 1.8580000305175781,
+      "type_id": 0,
+      "orientation_deg": 0,
+      "frozen": false
+    }
+  ]
+}

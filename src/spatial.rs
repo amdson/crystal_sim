@@ -4,104 +4,96 @@ use glam::Vec2;
 use crate::forces::lj_force_vec;
 use crate::particle::Particle;
 
-/// Unbounded grid-based spatial hash. Cell size is set to the largest bonding
-/// cutoff so a single-ring of cells always covers the full interaction range.
-pub struct SpatialHash {
-    cell_size: f32,
-    cells: HashMap<(i64, i64), Vec<usize>>,
-}
 
-impl SpatialHash {
-    pub fn new(cell_size: f32) -> Self {
-        Self { cell_size, cells: HashMap::new() }
-    }
+// // 32x32 grid of cells, each SxS units, with S a hyperparameter. 
+// let cell_size = 1.0;
+// let cells_per_side = 32;
+// let max_particles_cell = (2.0 * cell_size*cell_size / (PI * min_radius*min_radius)).ceil() as usize; // max close packing + buffer
+// pub struct Chunk {
+//     pub x: f32,
+//     pub y: f32,
+//     pub particles: Vec<Particle>,
+//     pub rates:            Vec<f64>,
+//     pub aggr_rate:        f64,
+//     pub attach_rates:     Vec<f64>,   // per-particle attachment rate sum
+//     pub aggr_attach_rate: f64,        // sum of attach_rates for this cell
+//     pub velocities:       Vec<Vec2>,
+//     pub new_pos:          Vec<Vec2>,
+//     pub ang_velocities:   Vec<f32>,
+//     pub new_orientation:  Vec<Vec2>,
+//     pub is_active:        Vec<bool>,
+//     pub is_frozen:        Vec<bool>,
+//     pub cell_sizes: Vec<usize>, // preallocated sizes for each cell's Vecs, to avoid reallocations during push
+// }
 
-    fn key(&self, x: f32, y: f32) -> (i64, i64) {
-        (
-            x.div_euclid(self.cell_size).floor() as i64,
-            y.div_euclid(self.cell_size).floor() as i64,
-        )
-    }
+// impl Chunk {
+//     fn new(x: f32, y: f32) -> Self {
+//         let cell_capacity = max_particles_cell * cells_per_side * cells_per_side;
+//         Self {
+//             x,
+//             y,
+//             particles: Vec::with_capacity(cell_capacity),
+//             rates: Vec::with_capacity(cell_capacity),
+//             aggr_rate: 0.0,
+//             attach_rates: Vec::with_capacity(cell_capacity),
+//             aggr_attach_rate: 0.0,
+//             velocities: Vec::with_capacity(cell_capacity),
+//             new_pos: Vec::with_capacity(cell_capacity),
+//             ang_velocities: Vec::with_capacity(cell_capacity),
+//             new_orientation: Vec::with_capacity(cell_capacity),
+//             is_active: Vec::with_capacity(cell_capacity),
+//             is_frozen: Vec::with_capacity(cell_capacity),
+//             cell_sizes: vec![max_particles_cell; cells_per_side * cells_per_side],
+//         }
+//     }
+// }
 
-    pub fn insert(&mut self, idx: usize, x: f32, y: f32) {
-        self.cells.entry(self.key(x, y)).or_default().push(idx);
-    }
-
-    pub fn remove(&mut self, idx: usize, x: f32, y: f32) {
-        let k = self.key(x, y);
-        if let Some(v) = self.cells.get_mut(&k) {
-            if let Some(p) = v.iter().position(|&i| i == idx) {
-                v.swap_remove(p);
-            }
-        }
-    }
-
-    pub fn batch_remove(&mut self, entries: &[(usize, f32, f32)]) {
-        for &(idx, x, y) in entries {
-            let k = self.key(x, y);
-            if let Some(v) = self.cells.get_mut(&k) {
-                if let Some(p) = v.iter().position(|&i| i == idx) {
-                    v.swap_remove(p);
-                }
-            }
-        }
-    }
-
-    pub fn query(&self, cx: f32, cy: f32, radius: f32) -> Vec<usize> {
-        let mut result = Vec::new();
-        self.query_into(cx, cy, radius, &mut result);
-        result
-    }
-
-    pub fn query_into(&self, cx: f32, cy: f32, radius: f32, out: &mut Vec<usize>) {
-        out.clear();
-        let min_gx = ((cx - radius) / self.cell_size).floor() as i64;
-        let max_gx = ((cx + radius) / self.cell_size).floor() as i64;
-        let min_gy = ((cy - radius) / self.cell_size).floor() as i64;
-        let max_gy = ((cy + radius) / self.cell_size).floor() as i64;
-
-        for gx in min_gx..=max_gx {
-            for gy in min_gy..=max_gy {
-                if let Some(v) = self.cells.get(&(gx, gy)) {
-                    out.extend_from_slice(v);
-                }
-            }
-        }
-    }
-}
+// pub struct SpatialGrid {
+//     pub cell_size: f32,
+//     pub chunks: Vec<Chunk>,
+//     pub chunk_map: HashMap<(i64, i64), usize>, // maps chunk grid keys to indices in `chunks`
+// }
 
 // ── ParticleGrid ─────────────────────────────────────────────────────────────
 
 /// Per-cell struct-of-arrays.  All Vecs inside a `Cell` are kept the same
 /// length; `swap_remove` on one must be mirrored across all others.
+/// 
+/// currently, the main datastructure is a hashmap pointing to cells containing vectors. However, this could be generating unfortunate cache behavior, and requires frequent allocations and deallocations. It'd be better to have preallocated chunks of cells, for instance 32x32, that rely on an upper bound on particles per cell to initialize all memory ahead of time. cells would then 
 pub struct Cell {
-    pub particles:        Vec<Particle>,
-    pub rates:            Vec<f64>,
-    pub aggr_rate:        f64,
-    pub attach_rates:     Vec<f64>,   // per-particle attachment rate sum
-    pub aggr_attach_rate: f64,        // sum of attach_rates for this cell
-    pub velocities:       Vec<Vec2>,
-    pub new_pos:          Vec<Vec2>,
-    pub ang_velocities:   Vec<f32>,
-    pub new_orientation:  Vec<Vec2>,
-    pub is_active:        Vec<bool>,
-    pub is_frozen:        Vec<bool>,
+    pub particles:           Vec<Particle>,
+    pub rates:               Vec<f64>,
+    pub aggr_rate:           f64,
+    pub attach_rates:        Vec<f64>,   // per-particle attachment rate sum
+    pub aggr_attach_rate:    f64,        // sum of attach_rates for this cell
+    pub velocities:          Vec<Vec2>,
+    pub new_pos:             Vec<Vec2>,
+    pub ang_velocities:      Vec<f32>,
+    pub new_orientation:     Vec<Vec2>,
+    pub is_active:           Vec<bool>,
+    pub is_frozen:           Vec<bool>,
+    /// Persistent frozen flag: survives physics resets; set for preset frozen particles.
+    pub permanently_frozen:  Vec<bool>,
+    /// If true, this particle's detach rate is always kept at 0 by set_rate.
+    pub no_detach:           Vec<bool>,
 }
 
 impl Cell {
     fn new() -> Self {
         Self {
-            particles:        Vec::new(),
-            rates:            Vec::new(),
-            aggr_rate:        0.0,
-            attach_rates:     Vec::new(),
-            aggr_attach_rate: 0.0,
-            velocities:       Vec::new(),
-            new_pos:          Vec::new(),
-            ang_velocities:   Vec::new(),
-            new_orientation:  Vec::new(),
-            is_active:        Vec::new(),
-            is_frozen:        Vec::new(),
+            particles:          Vec::new(),
+            rates:              Vec::new(),
+            aggr_rate:          0.0,
+            attach_rates:       Vec::new(),
+            aggr_attach_rate:   0.0,
+            velocities:         Vec::new(),
+            new_pos:            Vec::new(),
+            ang_velocities:     Vec::new(),
+            new_orientation:    Vec::new(),
+            is_active:          Vec::new(),
+            is_frozen:          Vec::new(),
+            permanently_frozen: Vec::new(),
+            no_detach:          Vec::new(),
         }
     }
 
@@ -118,6 +110,8 @@ impl Cell {
         self.new_orientation.push(ori);
         self.is_active.push(false);
         self.is_frozen.push(false);
+        self.permanently_frozen.push(false);
+        self.no_detach.push(false);
     }
 
     fn swap_remove(&mut self, ind: usize) -> (Particle, f64) {
@@ -132,6 +126,8 @@ impl Cell {
         self.new_orientation.swap_remove(ind);
         self.is_active.swap_remove(ind);
         self.is_frozen.swap_remove(ind);
+        self.permanently_frozen.swap_remove(ind);
+        self.no_detach.swap_remove(ind);
         (p, rate)
     }
 }
@@ -152,6 +148,7 @@ pub struct ParticleGrid {
     pub cell_forces:  Vec<Vec<Vec2>>,      // parallel to `cells`
     pub cell_torques: Vec<Vec<f32>>,       // parallel to `cells`
     pub cell_map:     HashMap<(i64, i64), usize>,
+    pub total_particles: usize,
 }
 
 impl ParticleGrid {
@@ -162,6 +159,7 @@ impl ParticleGrid {
             cell_forces:  Vec::new(),
             cell_torques: Vec::new(),
             cell_map:     HashMap::new(),
+            total_particles: 0,
         }
     }
 
@@ -191,6 +189,7 @@ impl ParticleGrid {
         self.cells[idx].push(p, rate);
         self.cell_forces[idx].push(Vec2::ZERO);
         self.cell_torques[idx].push(0.0);
+        self.total_particles += 1;
     }
 
     /// Remove the particle at `(cell_idx, ind)`.  The `Cell` struct stays; only
@@ -199,6 +198,7 @@ impl ParticleGrid {
         let (p, rate) = self.cells[cell_idx].swap_remove(ind);
         self.cell_forces[cell_idx].swap_remove(ind);
         self.cell_torques[cell_idx].swap_remove(ind);
+        self.total_particles -= 1;
         (p, rate)
     }
 
@@ -279,8 +279,36 @@ impl ParticleGrid {
         if let Some(&idx) = self.cell_map.get(&key) {
             let cell = &mut self.cells[idx];
             if let Some(ind) = cell.particles.iter().position(|p| p.pos == pos) {
+                if cell.no_detach[ind] { return; }
                 cell.aggr_rate += new_rate - cell.rates[ind];
                 cell.rates[ind] = new_rate;
+            }
+        }
+    }
+
+    /// Mark the particle at `pos` as permanently frozen (never moves during relaxation).
+    pub fn mark_permanently_frozen_at(&mut self, pos: Vec2) {
+        let key = self.cell_key(pos.x, pos.y);
+        if let Some(&idx) = self.cell_map.get(&key) {
+            let cell = &mut self.cells[idx];
+            if let Some(ind) = cell.particles.iter().position(|p| p.pos == pos) {
+                cell.permanently_frozen[ind] = true;
+                cell.is_frozen[ind] = true;
+            }
+        }
+    }
+
+    /// Mark the particle at `pos` as no-detach (detach rate kept at 0).
+    pub fn mark_no_detach_at(&mut self, pos: Vec2) {
+        let key = self.cell_key(pos.x, pos.y);
+        if let Some(&idx) = self.cell_map.get(&key) {
+            let cell = &mut self.cells[idx];
+            if let Some(ind) = cell.particles.iter().position(|p| p.pos == pos) {
+                cell.no_detach[ind] = true;
+                // Ensure rate stays 0; aggr_rate was already updated at insert time.
+                let old = cell.rates[ind];
+                cell.aggr_rate -= old;
+                cell.rates[ind] = 0.0;
             }
         }
     }
@@ -337,7 +365,8 @@ impl ParticleGrid {
                     cell.ang_velocities[i]  = 0.0;
                     cell.new_orientation[i] = cell.particles[i].orientation;
                     cell.is_active[i]       = false;
-                    cell.is_frozen[i]       = false;
+                    // Restore permanently frozen state so preset particles can't be activated.
+                    cell.is_frozen[i]       = cell.permanently_frozen[i];
                 }
                 cell.particles.len()
             };
@@ -371,7 +400,7 @@ impl ParticleGrid {
 
             cross_inds.sort_unstable_by(|a, b| b.cmp(a));
             for ind in cross_inds {
-                let (new_pos, new_ori, vel, omega, is_act, is_frz, rate, attach_rate) = {
+                let (new_pos, new_ori, vel, omega, is_act, is_frz, perm_frz, no_det, rate, attach_rate) = {
                     let c = &self.cells[cell_idx];
                     (
                         c.new_pos[ind],
@@ -380,6 +409,8 @@ impl ParticleGrid {
                         c.ang_velocities[ind],
                         c.is_active[ind],
                         c.is_frozen[ind],
+                        c.permanently_frozen[ind],
+                        c.no_detach[ind],
                         c.rates[ind],
                         c.attach_rates[ind],
                     )
@@ -392,10 +423,12 @@ impl ParticleGrid {
                 let target_idx = self.cell_map[&target_key];
                 let last = self.cells[target_idx].particles.len() - 1;
                 let tc = &mut self.cells[target_idx];
-                tc.velocities[last]     = vel;
-                tc.ang_velocities[last] = omega;
-                tc.is_active[last]      = is_act;
-                tc.is_frozen[last]      = is_frz;
+                tc.velocities[last]         = vel;
+                tc.ang_velocities[last]     = omega;
+                tc.is_active[last]          = is_act;
+                tc.is_frozen[last]          = is_frz;
+                tc.permanently_frozen[last] = perm_frz;
+                tc.no_detach[last]          = no_det;
                 // Restore attach_rate that was zeroed by insert/push.
                 tc.aggr_attach_rate += attach_rate;
                 tc.attach_rates[last] = attach_rate;
@@ -415,7 +448,7 @@ impl ParticleGrid {
                 cell.ang_velocities[i]  = 0.0;
                 cell.new_orientation[i] = cell.particles[i].orientation;
                 cell.is_active[i]       = false;
-                cell.is_frozen[i]       = false;
+                cell.is_frozen[i]       = cell.permanently_frozen[i];
             }
             for f in self.cell_forces[idx].iter_mut() { *f = Vec2::ZERO; }
             for t in self.cell_torques[idx].iter_mut() { *t = 0.0; }

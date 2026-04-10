@@ -40,14 +40,6 @@ pub mod utils {
     // }
     #[inline]
     pub fn exp3(x: f32) -> f32 {
-        // Saturate aggressively to avoid overflow/underflow and keep behavior stable.
-        // if x < -80.0 { return 0.0; }
-        // if x >  80.0 { return f32::INFINITY; }
-
-        // Approximate exp(x) by building the IEEE float bits directly.
-        let a: f32 = 12102203.0;          // 2^23 / ln(2)
-        let b: f32 = 1064866805.0;        // tuned bias constant
-        let bits = (a * x + b) as u32;
-        f32::from_bits(bits)
+        x.exp()
     }
 }

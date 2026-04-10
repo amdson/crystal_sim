@@ -273,6 +273,7 @@ impl EditorSim {
                         patch_tc,
                         self.epsilon_safe(ti, tj),
                         lj_cutoff,
+                        self.config.spring_k,
                     );
 
                     self.forces[i]  += f;

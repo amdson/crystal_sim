@@ -53,6 +53,7 @@ struct CrystalApp {
     mu: Vec<f32>,
     show_bonds: bool,
     show_candidates: bool,
+    show_orientation: bool,
 }
 
 impl CrystalApp {
@@ -76,6 +77,7 @@ impl CrystalApp {
             mu,
             show_bonds: true,
             show_candidates: false,
+            show_orientation: false,
         }
     }
 
@@ -177,6 +179,7 @@ impl eframe::App for CrystalApp {
 
             ui.checkbox(&mut self.show_bonds, "Show bonds");
             ui.checkbox(&mut self.show_candidates, "Show candidates");
+            ui.checkbox(&mut self.show_orientation, "Show orientation");
 
             ui.separator();
 
@@ -298,6 +301,23 @@ impl eframe::App for CrystalApp {
                         screen_r,
                         Stroke::new(0.8, Color32::from_rgba_unmultiplied(255, 255, 255, 50)),
                     );
+                }
+
+                // Orientation arrow: line from center toward orientation direction.
+                if self.show_orientation && screen_r > 3.0 {
+                    let ox = particle.orientation.x;
+                    let oy = -particle.orientation.y; // flip for screen space
+                    let tip = Pos2::new(pos.x + ox * screen_r * 0.75, pos.y + oy * screen_r * 0.75);
+                    let arrow_color = Color32::from_rgba_unmultiplied(255, 255, 255, 200);
+                    painter.line_segment([pos, tip], Stroke::new(1.5, arrow_color));
+                    // Small arrowhead: two lines at ±30° from the tip
+                    let head_len = screen_r * 0.25;
+                    let angle = oy.atan2(ox);
+                    for sign in [-1.0f32, 1.0] {
+                        let a = angle + sign * std::f32::consts::PI * 5.0 / 6.0;
+                        let h = Pos2::new(tip.x + a.cos() * head_len, tip.y + a.sin() * head_len);
+                        painter.line_segment([tip, h], Stroke::new(1.5, arrow_color));
+                    }
                 }
 
                 // Patch markers: draw small squares on the particle boundary.

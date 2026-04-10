@@ -23,6 +23,7 @@ pub fn patch_dir(orientation: Vec2, position_cs: Vec2) -> Vec2 {
 /// 2^(-1/6): scale factor so that the LJ minimum is exactly at r_contact.
 const SIGMA_FACTOR: f32 = 0.890_898_7;
 
+
 /// Lennard-Jones potential (no cutoff).
 pub fn lj_potential(r: f32, r_contact: f32, epsilon: f32) -> f32 {
     let sigma = r_contact * SIGMA_FACTOR;
@@ -172,6 +173,7 @@ pub fn patchy_force_torque(
     patch_type_count: usize,
     epsilon_fallback: f32,
     lj_cutoff_factor: f32,
+    spring_k: f32,
 ) -> (Vec2, f32, f32) {
     let r2 = r_vec.length_squared();
     if r2 < 1e-24 {
@@ -191,7 +193,14 @@ pub fn patchy_force_torque(
     }
 
     // Isotropic backbone repulsion.
-    let mut force = -repulsive_force_vec(r_vec, r_contact, r_cut_default);
+    // let mut force = -repulsive_force_vec(r_vec, r_contact, r_cut_default);
+    // One-sided harmonic spring: zero force at r_contact, repulsive for r < r_contact.
+    // Energy = spring_k * (r - r_contact)^2; force on i = 2*spring_k*(r-r_contact)*r_hat (negative = repulsive when r < r_contact).
+    let mut force = if r < r_contact {
+        2.0 * spring_k * (r - r_contact) * r_hat
+    } else {
+        Vec2::ZERO
+    };
     let mut tau_i = 0.0f32;
     let mut tau_j = 0.0f32;
 
@@ -298,6 +307,172 @@ mod tests {
         Vec2::new(r.cos(), r.sin())
     }
 
+    // ── Helpers shared by spacing/energy/gradient tests ─────────────────────
+
+    /// Perfectly aligned A-B pair: i at origin with A-patch at 0°, j at (r, 0)
+    /// with B-patch at 0° body frame but orientation 180° so it faces back toward i.
+    /// At this geometry: cos_ia = 1, cos_jb = 1, all angular terms = 1, torques = 0.
+    fn aligned_lut(epsilon: f32, sigma_deg: f32, cutoff: f32) -> Vec<PatchLutEntry> {
+        let sigma = sigma_deg * PI / 180.0;
+        let mut lut = vec![PatchLutEntry::default(); 4]; // 2x2
+        let entry = PatchLutEntry { epsilon, sigma_i: sigma, sigma_j: sigma, cutoff, enabled: true };
+        lut[0 * 2 + 1] = entry; // A on i-side, B on j-side
+        lut[1 * 2 + 0] = entry; // B on i-side, A on j-side (symmetric)
+        lut
+    }
+
+    // ── 1. Bump function ─────────────────────────────────────────────────────
+
+    #[test]
+    fn bump_peaks_at_contact_and_zero_at_bounds() {
+        let r_contact = 2.0f32;
+        let r_cut = r_contact * 1.25;
+        let width = r_cut - r_contact;
+
+        let (b_contact, _) = contact_bump_with_derivative(r_contact, r_contact, r_cut);
+        assert!((b_contact - 1.0).abs() < 1e-6,
+            "bump at contact should be 1.0, got {b_contact}");
+
+        let (b_hi, _) = contact_bump_with_derivative(r_cut, r_contact, r_cut);
+        assert!(b_hi == 0.0, "bump at upper cutoff should be 0, got {b_hi}");
+
+        let r_lo = 2.0 * r_contact - r_cut;
+        let (b_lo, _) = contact_bump_with_derivative(r_lo, r_contact, r_cut);
+        assert!(b_lo == 0.0, "bump at lower cutoff should be 0, got {b_lo}");
+
+        // Nearby points should be strictly smaller
+        let dr = width * 0.01;
+        let (b_plus,  _) = contact_bump_with_derivative(r_contact + dr, r_contact, r_cut);
+        let (b_minus, _) = contact_bump_with_derivative(r_contact - dr, r_contact, r_cut);
+        assert!(b_plus  < b_contact, "bump should decrease above contact: {b_plus} vs {b_contact}");
+        assert!(b_minus < b_contact, "bump should decrease below contact: {b_minus} vs {b_contact}");
+    }
+
+    // ── 2. Energy at perfect alignment ───────────────────────────────────────
+
+    #[test]
+    fn energy_at_perfect_alignment_equals_epsilon() {
+        let epsilon = -1.5f32;
+        let r_contact = 2.0f32;
+        let lut = aligned_lut(epsilon, 30.0, 1.25);
+
+        let i_patches = vec![patch("A", 0, 0.0)];
+        let j_patches = vec![patch("B", 1, 0.0)];
+
+        let r_vec = Vec2::new(r_contact, 0.0);
+        let e = patchy_pair_energy(
+            r_vec, r_contact,
+            &i_patches, ori(0.0),
+            &j_patches, ori(180.0),
+            &lut, 2, 0.0, 0.3,
+        );
+
+        assert!((e - epsilon).abs() < 1e-4,
+            "expected energy {epsilon} at contact with perfect alignment, got {e}");
+    }
+
+    // ── 3. Force equilibrium distance ────────────────────────────────────────
+
+    #[test]
+    fn force_equilibrium_is_at_contact_distance() {
+        // If this fails the equilibrium distance != r_contact, which means
+        // relaxation settles particles further apart than the energy minimum.
+        let epsilon = -1.5f32;
+        let r_contact = 2.0f32;
+        let lj_cutoff = 3.0f32;
+        let lut = aligned_lut(epsilon, 30.0, 1.25);
+
+        let i_patches = vec![patch("A", 0, 0.0)];
+        let j_patches = vec![patch("B", 1, 0.0)];
+
+        // Sweep r and record the radial force on i (positive = repulsive, away from j).
+        let steps = 2000;
+        let r_lo = r_contact * 0.7;
+        let r_hi = r_contact * 1.4;
+        let mut eq_r = f32::NAN;
+        let mut prev_fx = f32::NAN;
+        let mut prev_r  = f32::NAN;
+
+        for k in 0..=steps {
+            let r = r_lo + (r_hi - r_lo) * k as f32 / steps as f32;
+            let r_vec = Vec2::new(r, 0.0);
+            let (f, _, _) = patchy_force_torque(
+                r_vec, r_contact,
+                &i_patches, ori(0.0),
+                &j_patches, ori(180.0),
+                &lut, 2, 0.0, lj_cutoff, 50.0,
+            );
+            if !prev_fx.is_nan() && prev_fx > 0.0 && f.x <= 0.0 {
+                // Linear interpolation for the zero
+                eq_r = prev_r + (r - prev_r) * prev_fx / (prev_fx - f.x);
+                break;
+            }
+            prev_fx = f.x;
+            prev_r  = r;
+        }
+
+        assert!(!eq_r.is_nan(), "no force zero crossing found in [{r_lo}, {r_hi}]");
+
+        let deviation = (eq_r - r_contact) / r_contact;
+        assert!(
+            deviation.abs() < 0.01,
+            "force equilibrium at r={eq_r:.4} deviates {:.2}% from r_contact={r_contact} \
+             — backbone repulsion is pushing particles apart",
+            deviation * 100.0
+        );
+    }
+
+    // ── 4. Force is the negative gradient of energy ──────────────────────────
+
+    #[test]
+    fn radial_force_matches_negative_energy_gradient() {
+        // Tests consistency between patchy_pair_energy and patchy_force_torque.
+        // A mismatch means the relaxation doesn't minimise the energy used for rates.
+        let epsilon = -1.5f32;
+        let r_contact = 2.0f32;
+        let lj_cutoff = 3.0f32;
+        let lut = aligned_lut(epsilon, 30.0, 1.25);
+
+        let i_patches = vec![patch("A", 0, 0.0)];
+        let j_patches = vec![patch("B", 1, 0.0)];
+
+        // Test at a few distances inside the interaction range.
+        let test_rs = [r_contact * 0.85, r_contact * 0.95, r_contact * 1.05, r_contact * 1.15];
+        let dr = r_contact * 1e-4;
+        let mut max_err = 0.0f32;
+
+        for &r in &test_rs {
+            let e_plus = patchy_pair_energy(
+                Vec2::new(r + dr, 0.0), r_contact,
+                &i_patches, ori(0.0), &j_patches, ori(180.0),
+                &lut, 2, 0.0, 0.3,
+            );
+            let e_minus = patchy_pair_energy(
+                Vec2::new(r - dr, 0.0), r_contact,
+                &i_patches, ori(0.0), &j_patches, ori(180.0),
+                &lut, 2, 0.0, 0.3,
+            );
+            let numerical_fx = -(e_plus - e_minus) / (2.0 * dr);
+
+            let (f, _, _) = patchy_force_torque(
+                Vec2::new(r, 0.0), r_contact,
+                &i_patches, ori(0.0), &j_patches, ori(180.0),
+                &lut, 2, 0.0, lj_cutoff, 50.0,
+            );
+
+            let err = (f.x - numerical_fx).abs();
+            max_err = max_err.max(err);
+            println!("r={r:.4}  F_actual={:.6}  F_numerical={numerical_fx:.6}  err={err:.2e}",
+                f.x);
+        }
+
+        assert!(
+            max_err < 0.01,
+            "max force/gradient mismatch = {max_err:.4} \
+             — patchy_force_torque is not the gradient of patchy_pair_energy"
+        );
+    }
+
     #[test]
     fn torque_is_nonzero_for_misaligned_ab_pair() {
         let i_patches = vec![patch("A", 0, 20.0)];
@@ -327,6 +502,7 @@ mod tests {
             2,
             0.0,
             3.0,
+            50.0,
         );
 
         assert!(tau_i.abs() > 1e-6, "expected nonzero tau_i, got {tau_i}");
@@ -376,6 +552,7 @@ mod tests {
                     2,
                     0.0,
                     3.0,
+                    50.0,
                 );
                 torques[i] += tau_i;
                 torques[j] += tau_j;
