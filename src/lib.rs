@@ -6,7 +6,7 @@ pub mod kmc;
 pub mod particle;
 mod rates;
 mod rng;
-mod spatial;
+pub mod spatial;
 pub mod math_utils;
 
 pub use editor_sim::EditorSim;

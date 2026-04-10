@@ -7,7 +7,7 @@ use crate::config::SimConfig;
 use crate::forces::{patchy_force_torque, patchy_pair_energy};
 use crate::particle::Particle;
 use crate::rng::Rng;
-use crate::spatial::ParticleGrid;
+use crate::spatial::{ParticleGrid, CELL_CAP};
 
 /// Read the CPU timestamp counter — ~4 cycles, no syscall.
 #[inline(always)]
@@ -70,7 +70,7 @@ pub struct Simulation {
     pub timers: Vec<u64>,
     pub usages: Vec<u64>,
     cpu_ghz: f64,
-
+    
     particle_buf: Vec<f32>, // Flat buffer of (x, y, type_id, radius, orientation) for WASM export.
 
     /// Deterministic test-mode state (only used when `config.testing_mode` is true).
@@ -131,8 +131,8 @@ impl Simulation {
                 sim.add_particle_raw(Particle::new(0.0, 0.0, 0, r0, Vec2::X));
                 // Compute initial attach rate for the seed particle.
                 let key = sim.particle_grid.cell_key(0.0, 0.0);
-                if let Some(&cell_idx) = sim.particle_grid.cell_map.get(&key) {
-                    if !sim.particle_grid.cells[cell_idx].particles.is_empty() {
+                if let Some(cell_idx) = sim.particle_grid.cell_idx_lookup(key.0, key.1) {
+                    if sim.particle_grid.cell_len[cell_idx] > 0 {
                         sim.update_attach_rate(cell_idx, 0);
                     }
                 }
@@ -456,9 +456,9 @@ impl Simulation {
         let candidates = self.generate_candidates_for_particle(cell, idx);
         if candidates.is_empty() {
             // Rate was stale; zero it out so we don't keep sampling this particle.
-            self.particle_grid.cells[cell].aggr_attach_rate -=
-                self.particle_grid.cells[cell].attach_rates[idx];
-            self.particle_grid.cells[cell].attach_rates[idx] = 0.0;
+            let flat = cell * CELL_CAP + idx;
+            self.particle_grid.cell_aggr_attach[cell] -= self.particle_grid.attach_rates[flat];
+            self.particle_grid.attach_rates[flat] = 0.0;
             return;
         }
 
@@ -525,7 +525,7 @@ impl Simulation {
         };
 
         // Snapshot the particle and its neighbours before removal.
-        let detach_p = self.particle_grid.cells[cell].particles[ind].clone();
+        let detach_p = self.particle_grid.particles[cell * CELL_CAP + ind].clone();
         let nbs = self.get_neighbors(&detach_p);
         let pos = detach_p.pos;
 
@@ -599,9 +599,8 @@ impl Simulation {
         let config = &self.config;
         let rc = config.radius(type_c);
         let query_r = rc + config.max_radius() + config.delta;
-        let nearby = self.particle_grid.query(pos.x, pos.y, query_r);
         let mut energy = 0.0f32;
-        for nb in &nearby {
+        self.particle_grid.query_iter(pos.x, pos.y, query_r, |nb| {
             let r_vec = nb.pos - pos;
             let r_contact = rc + nb.radius;
             energy += patchy_pair_energy(
@@ -611,7 +610,7 @@ impl Simulation {
                 &config.patch_lut, config.patch_type_count,
                 config.epsilon(type_c, nb.type_id), config.delta,
             );
-        }
+        });
         energy
     }
 
@@ -620,7 +619,7 @@ impl Simulation {
     /// and accumulate attach_rate if the interaction is attractive.
     fn compute_attach_rate_sum(&self, cell: usize, idx: usize) -> f64 {
         let (a_pos, a_r, a_type, a_ori) = {
-            let p = &self.particle_grid.cells[cell].particles[idx];
+            let p = &self.particle_grid.particles[cell * CELL_CAP + idx];
             (p.pos, p.radius, p.type_id, p.orientation)
         };
 
@@ -710,7 +709,7 @@ impl Simulation {
     /// Returns Vec<(CandidateSite, rate)>.
     fn generate_candidates_for_particle(&self, cell: usize, idx: usize) -> Vec<(CandidateSite, f64)> {
         let (a_pos, a_r, a_type, a_ori) = {
-            let p = &self.particle_grid.cells[cell].particles[idx];
+            let p = &self.particle_grid.particles[cell * CELL_CAP + idx];
             (p.pos, p.radius, p.type_id, p.orientation)
         };
 
@@ -793,19 +792,22 @@ impl Simulation {
     /// Recompute and store the attach rate sum for the particle at (cell, idx).
     fn update_attach_rate(&mut self, cell: usize, idx: usize) {
         let rate = self.compute_attach_rate_sum(cell, idx);
-        let old = self.particle_grid.cells[cell].attach_rates[idx];
-        self.particle_grid.cells[cell].attach_rates[idx] = rate;
-        self.particle_grid.cells[cell].aggr_attach_rate += rate - old;
+        let flat = cell * CELL_CAP + idx;
+        let old = self.particle_grid.attach_rates[flat];
+        self.particle_grid.attach_rates[flat] = rate;
+        self.particle_grid.cell_aggr_attach[cell] += rate - old;
     }
 
     /// Find the particle at `pos` in the grid and update its attach rate.
     fn update_attach_rate_for_particle_at(&mut self, pos: Vec2) {
         let key = self.particle_grid.cell_key(pos.x, pos.y);
-        let cell_idx = match self.particle_grid.cell_map.get(&key) {
-            Some(&i) => i,
+        let cell_idx = match self.particle_grid.cell_idx_lookup(key.0, key.1) {
+            Some(i) => i,
             None => return,
         };
-        let part_idx = match self.particle_grid.cells[cell_idx].particles.iter().position(|p| p.pos == pos) {
+        let base = cell_idx * CELL_CAP;
+        let len  = self.particle_grid.cell_len[cell_idx] as usize;
+        let part_idx = match (0..len).find(|&s| self.particle_grid.particles[base + s].pos == pos) {
             Some(i) => i,
             None => return,
         };
@@ -815,11 +817,10 @@ impl Simulation {
     /// Update attach rates for all particles within interaction range of `pos`.
     fn update_neighbors_attach_rates(&mut self, pos: Vec2) {
         let radius = self.config.max_cutoff() * 2.0 + self.config.max_radius();
-        let neighbor_pos: Vec<Vec2> = self.particle_grid
-            .query(pos.x, pos.y, radius)
-            .into_iter()
-            .map(|p| p.pos)
-            .collect();
+        let mut neighbor_pos: Vec<Vec2> = Vec::new();
+        self.particle_grid.query_iter(pos.x, pos.y, radius, |p| {
+            neighbor_pos.push(p.pos);
+        });
         for npos in neighbor_pos {
             self.update_attach_rate_for_particle_at(npos);
         }
@@ -880,18 +881,19 @@ impl Simulation {
             let mut best_pos = Vec2::ZERO;
             let mut total_candidates = 0usize;
 
-            for cell_idx in 0..self.particle_grid.cells.len() {
-                let n = self.particle_grid.cells[cell_idx].particles.len();
-                for part_idx in 0..n {
-                    let candidates = self.generate_candidates_for_particle(cell_idx, part_idx);
-                    for (site, _rate) in &candidates {
-                        if site.type_id != type_c { continue; }
-                        total_candidates += 1;
-                        let e = self.site_energy_for_orientation(site.pos, type_c, site.orientation);
-                        if e < best_energy {
-                            best_energy = e;
-                            best_pos = site.pos;
-                        }
+            let cell_particle_pairs: Vec<(usize, usize)> =
+                self.particle_grid.nonempty_cell_iter()
+                    .flat_map(|(cidx, len)| (0..len).map(move |s| (cidx, s)))
+                    .collect();
+            for (cell_idx, part_idx) in cell_particle_pairs {
+                let candidates = self.generate_candidates_for_particle(cell_idx, part_idx);
+                for (site, _rate) in &candidates {
+                    if site.type_id != type_c { continue; }
+                    total_candidates += 1;
+                    let e = self.site_energy_for_orientation(site.pos, type_c, site.orientation);
+                    if e < best_energy {
+                        best_energy = e;
+                        best_pos = site.pos;
                     }
                 }
             }
@@ -912,14 +914,15 @@ impl Simulation {
             let type_c = assertion.type_id;
             let mut total_rate = 0.0f64;
 
-            for cell_idx in 0..self.particle_grid.cells.len() {
-                let n = self.particle_grid.cells[cell_idx].particles.len();
-                for part_idx in 0..n {
-                    let candidates = self.generate_candidates_for_particle(cell_idx, part_idx);
-                    for (site, rate) in &candidates {
-                        if site.type_id == type_c {
-                            total_rate += rate;
-                        }
+            let cell_particle_pairs: Vec<(usize, usize)> =
+                self.particle_grid.nonempty_cell_iter()
+                    .flat_map(|(cidx, len)| (0..len).map(move |s| (cidx, s)))
+                    .collect();
+            for (cell_idx, part_idx) in cell_particle_pairs {
+                let candidates = self.generate_candidates_for_particle(cell_idx, part_idx);
+                for (site, rate) in &candidates {
+                    if site.type_id == type_c {
+                        total_rate += rate;
                     }
                 }
             }
@@ -966,9 +969,10 @@ impl Simulation {
 
         let mut attach_rates: Vec<f64> = Vec::new();
         let mut detach_rates: Vec<f64> = Vec::new();
-        for cell in &self.particle_grid.cells {
-            attach_rates.extend_from_slice(&cell.attach_rates);
-            detach_rates.extend_from_slice(&cell.rates);
+        for (cidx, len) in self.particle_grid.nonempty_cell_iter() {
+            let base = cidx * CELL_CAP;
+            attach_rates.extend_from_slice(&self.particle_grid.attach_rates[base..base + len]);
+            detach_rates.extend_from_slice(&self.particle_grid.rates[base..base + len]);
         }
 
         if !attach_rates.is_empty() {
@@ -1070,8 +1074,8 @@ impl Simulation {
             v
         };
 
-        let cell_ind: Vec<Option<usize>> = keys.iter().map(|k| {
-            self.particle_grid.cell_map.get(k).copied()
+        let cell_ind: Vec<Option<usize>> = keys.iter().map(|(gx, gy)| {
+            self.particle_grid.cell_idx_lookup(*gx, *gy)
         }).collect();
 
         let slot_is_active = |s: usize| -> bool {
@@ -1084,12 +1088,13 @@ impl Simulation {
         let active_slots: Vec<usize> = (0..n).filter(|&s| slot_is_active(s)).collect();
         self.particle_grid.init_physics_for_cells(keys.iter().copied());
         for &s in &active_slots {
-            if let Some(cell_idx) = cell_ind[s] {
-                let cell = &mut self.particle_grid.cells[cell_idx];
-                for i in 0..cell.is_active.len() {
+            if let Some(cidx) = cell_ind[s] {
+                let base = cidx * CELL_CAP;
+                let len  = self.particle_grid.cell_len[cidx] as usize;
+                for i in 0..len {
                     // Permanently frozen particles must never be activated.
-                    if !cell.permanently_frozen[i] {
-                        cell.is_active[i] = true;
+                    if !self.particle_grid.permanently_frozen[base + i] {
+                        self.particle_grid.is_active[base + i] = true;
                     }
                 }
             }
@@ -1105,30 +1110,29 @@ impl Simulation {
         // ── Relaxation loop ───────────────────────────────────────────────────
         for _ in 0..self.config.relax_steps {
             // Zero forces and torques.
-            for &idx in &initialized_cell_indices {
-                if let Some(fs) = self.particle_grid.cell_forces.get_mut(idx) {
-                    for f in fs.iter_mut() { *f = Vec2::ZERO; }
-                }
-                if let Some(ts) = self.particle_grid.cell_torques.get_mut(idx) {
-                    for t in ts.iter_mut() { *t = 0.0; }
+            for &cidx in &initialized_cell_indices {
+                let base = cidx * CELL_CAP;
+                let len  = self.particle_grid.cell_len[cidx] as usize;
+                for i in 0..len {
+                    self.particle_grid.cell_forces[base + i]  = Vec2::ZERO;
+                    self.particle_grid.cell_torques[base + i] = 0.0;
                 }
             }
 
             // Accumulate patchy forces and torques via cached cell indices.
             for &ai_slot in &active_slots {
-                let a_ind = cell_ind[ai_slot];
-                if a_ind.is_none() { continue; }
-                let a_ind = a_ind.unwrap();
-                let a_cell = &self.particle_grid.cells[a_ind];
-                let a_gx = (ai_slot % w) as i64;
-                let a_gy = (ai_slot / w) as i64;
+                let a_cidx = match cell_ind[ai_slot] { Some(c) => c, None => continue };
+                let a_base = a_cidx * CELL_CAP;
+                let a_len  = self.particle_grid.cell_len[a_cidx] as usize;
+                let a_gx   = (ai_slot % w) as i64;
+                let a_gy   = (ai_slot / w) as i64;
 
-                for ai in 0..a_cell.particles.len() {
-                    if !a_cell.is_active[ai] { continue; }
-                    let a_pos    = a_cell.particles[ai].pos;
-                    let a_r      = a_cell.particles[ai].radius;
-                    let a_type   = a_cell.particles[ai].type_id;
-                    let a_ori    = a_cell.particles[ai].orientation;
+                for ai in 0..a_len {
+                    if !self.particle_grid.is_active[a_base + ai] { continue; }
+                    let a_pos  = self.particle_grid.particles[a_base + ai].pos;
+                    let a_r    = self.particle_grid.particles[a_base + ai].radius;
+                    let a_type = self.particle_grid.particles[a_base + ai].type_id;
+                    let a_ori  = self.particle_grid.particles[a_base + ai].orientation;
 
                     for dx in -cell_r..=cell_r {
                         let nb_gx = a_gx + dx;
@@ -1138,22 +1142,21 @@ impl Simulation {
                             if nb_gy < 0 || nb_gy >= w as i64 { continue; }
                             let nb_slot = nb_gy as usize * w + nb_gx as usize;
 
-                            let b_ind = cell_ind[nb_slot];
-                            if b_ind.is_none() { continue; }
-                            let b_ind = b_ind.unwrap();
-                            let b_cell = &self.particle_grid.cells[b_ind];
+                            let b_cidx = match cell_ind[nb_slot] { Some(c) => c, None => continue };
+                            let b_base = b_cidx * CELL_CAP;
+                            let b_len  = self.particle_grid.cell_len[b_cidx] as usize;
 
-                            for bi in 0..b_cell.particles.len() {
+                            for bi in 0..b_len {
                                 if nb_slot == ai_slot && bi == ai { continue; }
-                                let b_is_active = b_cell.is_active[bi];
+                                let b_is_active = self.particle_grid.is_active[b_base + bi];
                                 if b_is_active && (nb_slot < ai_slot || (nb_slot == ai_slot && bi < ai)) {
                                     continue;
                                 }
-                                let b_pos  = b_cell.particles[bi].pos;
-                                let b_r    = b_cell.particles[bi].radius;
-                                let b_type = b_cell.particles[bi].type_id;
-                                let b_ori  = b_cell.particles[bi].orientation;
-                                let b_frz  = b_cell.is_frozen[bi];
+                                let b_pos  = self.particle_grid.particles[b_base + bi].pos;
+                                let b_r    = self.particle_grid.particles[b_base + bi].radius;
+                                let b_type = self.particle_grid.particles[b_base + bi].type_id;
+                                let b_ori  = self.particle_grid.particles[b_base + bi].orientation;
+                                let b_frz  = self.particle_grid.is_frozen[b_base + bi];
 
                                 let r_contact = a_r + b_r;
                                 let r2 = (b_pos - a_pos).length_squared();
@@ -1175,17 +1178,13 @@ impl Simulation {
                                 );
 
                                 if f != Vec2::ZERO || tau_a != 0.0 {
-                                    let af = &mut self.particle_grid.cell_forces[a_ind];
-                                    if ai < af.len() { af[ai] += f; }
-                                    let at_ = &mut self.particle_grid.cell_torques[a_ind];
-                                    if ai < at_.len() { at_[ai] += tau_a; }
+                                    self.particle_grid.cell_forces[a_base + ai]  += f;
+                                    self.particle_grid.cell_torques[a_base + ai] += tau_a;
                                 }
 
                                 if b_is_active || !b_frz {
-                                    let bf = &mut self.particle_grid.cell_forces[b_ind];
-                                    if bi < bf.len() { bf[bi] -= f; }
-                                    let bt = &mut self.particle_grid.cell_torques[b_ind];
-                                    if bi < bt.len() { bt[bi] += tau_b; }
+                                    self.particle_grid.cell_forces[b_base + bi]  -= f;
+                                    self.particle_grid.cell_torques[b_base + bi] += tau_b;
                                 }
                             }
                         }
@@ -1195,45 +1194,45 @@ impl Simulation {
 
             // Velocity + angular-velocity step (FIRE-style damped).
             let mut converged = true;
-            for &cp in &active_cell_indices {
-                let cell = &mut self.particle_grid.cells[cp];
-                let fp   = &self.particle_grid.cell_forces[cp];
-                let tp   = &self.particle_grid.cell_torques[cp];
+            for &cidx in &active_cell_indices {
+                let base = cidx * CELL_CAP;
+                let len  = self.particle_grid.cell_len[cidx] as usize;
 
-                for ind in 0..cell.particles.len() {
-                    if !cell.is_active[ind] { continue; }
+                for ind in 0..len {
+                    let flat = base + ind;
+                    if !self.particle_grid.is_active[flat] { continue; }
 
                     // Linear
-                    let f_raw     = fp.get(ind).copied().unwrap_or(Vec2::ZERO);
+                    let f_raw     = self.particle_grid.cell_forces[flat];
                     let f_clamped = f_raw.clamp_length_max(3.0);
                     let f_mag     = f_clamped.length();
                     let f_eff     = if f_mag > static_friction {
                         f_clamped * ((f_mag - static_friction) / f_mag)
                     } else { Vec2::ZERO };
 
-                    let v_raw = damping * cell.velocities[ind] + alpha * f_eff;
+                    let v_raw = damping * self.particle_grid.velocities[flat] + alpha * f_eff;
                     let v_new = if v_raw.dot(f_eff) >= 0.0 { v_raw } else { Vec2::ZERO };
 
-                    cell.new_pos[ind]    = cell.particles[ind].pos + v_new;
-                    cell.velocities[ind] = v_new;
+                    self.particle_grid.new_pos[flat]    = self.particle_grid.particles[flat].pos + v_new;
+                    self.particle_grid.velocities[flat] = v_new;
 
                     // Angular
-                    let tau_raw     = tp.get(ind).copied().unwrap_or(0.0);
+                    let tau_raw     = self.particle_grid.cell_torques[flat];
                     let tau_clamped = tau_raw.clamp(-3.0, 3.0);
                     let tau_eff     = if tau_clamped.abs() > static_friction { tau_clamped } else { 0.0 };
-                    let omega_raw   = damping * cell.ang_velocities[ind] + alpha * tau_eff;
+                    let omega_raw   = damping * self.particle_grid.ang_velocities[flat] + alpha * tau_eff;
                     let omega_new   = if omega_raw * tau_eff >= 0.0 { omega_raw } else { 0.0 };
 
                     let (s, c) = omega_new.sin_cos();
-                    let ori = cell.particles[ind].orientation;
+                    let ori = self.particle_grid.particles[flat].orientation;
                     let new_ori = Vec2::new(ori.x * c - ori.y * s, ori.x * s + ori.y * c);
                     let len_sq = new_ori.length_squared();
-                    cell.new_orientation[ind] = if (len_sq - 1.0).abs() > 1e-6 {
+                    self.particle_grid.new_orientation[flat] = if (len_sq - 1.0).abs() > 1e-6 {
                         new_ori / len_sq.sqrt()
                     } else {
                         new_ori
                     };
-                    cell.ang_velocities[ind]  = omega_new;
+                    self.particle_grid.ang_velocities[flat] = omega_new;
 
                     if f_eff.length_squared() >= 0.05 * 0.05 || tau_eff.abs() >= 0.05 {
                         converged = false;
@@ -1267,11 +1266,10 @@ impl Simulation {
 
         // Update attach rates for all particles in the active zone and neighbours.
         let update_r = act_radius + self.config.max_cutoff() * 2.0;
-        let to_update_pos: Vec<Vec2> = self.particle_grid
-            .query(new_p.pos.x, new_p.pos.y, update_r)
-            .into_iter()
-            .map(|p| p.pos)
-            .collect();
+        let mut to_update_pos: Vec<Vec2> = Vec::new();
+        self.particle_grid.query_iter(new_p.pos.x, new_p.pos.y, update_r, |p| {
+            to_update_pos.push(p.pos);
+        });
         for pos in to_update_pos {
             self.update_attach_rate_for_particle_at(pos);
         }
