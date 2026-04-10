@@ -1,0 +1,88 @@
+{
+  "particle_types": [
+    {
+      "radius": 1.0,
+      "color": "#FF6B6B",
+      "mu": -1.5,
+      "patches": [
+        { "patch_type": "ANE", "position_deg":  30.0 },
+        { "patch_type": "ANW", "position_deg": 150.0 },
+        { "patch_type": "AS",  "position_deg": 270.0 }
+      ]
+    },
+    {
+      "radius": 1.0,
+      "color": "#4ECDC4",
+      "mu": -1.5,
+      "patches": [
+        { "patch_type": "BSW", "position_deg": 210.0 },
+        { "patch_type": "BSE", "position_deg": 330.0 },
+        { "patch_type": "BN",  "position_deg":  90.0 }
+      ]
+    }
+  ],
+  "epsilon": [
+    [0.15, 0.15],
+    [0.15, 0.15]
+  ],
+  "delta": 0.2,
+  "temperature": 0.12,
+  "nu": 0.05,
+  "seed": 42,
+  "num_isolated_angles": 35,
+  "max_arc_sites_per_type": 35,
+  "relax_steps": 20,
+  "relax_alpha": 0.015,
+  "spring_k": 10.0,
+  "steps_per_frame": 10,
+  "static_friction": 0.12,
+  "lj_cutoff_factor": 3.0,
+  "relax_damping": 0.8,
+  "patch_interactions": [
+    {
+      "types": ["ANE", "BSW"],
+      "epsilon": -1.5,
+      "angular_width_deg": [20.0, 20.0],
+      "cutoff": 1.25
+    },
+    {
+      "types": ["ANW", "BSE"],
+      "epsilon": -1.5,
+      "angular_width_deg": [20.0, 20.0],
+      "cutoff": 1.25
+    },
+    {
+      "types": ["AS", "BN"],
+      "epsilon": -1.5,
+      "angular_width_deg": [20.0, 20.0],
+      "cutoff": 1.25
+    }
+  ],
+  "print_rate_diagnostics": true,
+  "initial_lines": [
+    {
+      "x": 0.0,
+      "y": 0.0,
+      "type_id": 0,
+      "orientation_deg": 0.0,
+      "direction_deg": 0.0,
+      "spacing": 3.4641,
+      "count": 15,
+      "skip_first": false,
+      "frozen": true,
+      "no_detach": true
+    },
+    {
+      "x": 1.7321,
+      "y": 1.0,
+      "type_id": 1,
+      "orientation_deg": 0.0,
+      "direction_deg": 0.0,
+      "spacing": 3.4641,
+      "count": 15,
+      "skip_first": false,
+      "frozen": true,
+      "no_detach": true
+    }
+  ]
+}

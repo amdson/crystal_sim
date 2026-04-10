@@ -24,7 +24,6 @@
         { "patch_type": "NE1", "position_deg":   60.0 },
         { "patch_type": "SE", "position_deg": 240.0 },
         { "patch_type": "E1",  "position_deg":   300.0 }
-
       ]
     },
     {
